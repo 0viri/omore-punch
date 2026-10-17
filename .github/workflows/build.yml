@@ -1,0 +1,74 @@
+name: Build Omore Punch (VST3 & CLAP)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact_suffix: linux-x86_64
+          - os: windows-latest
+            artifact_suffix: windows-x86_64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux X11/GL dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-dri2-0-dev \
+            libxcb-icccm4-dev \
+            libxcb1-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxrandr-dev \
+            libgl1-mesa-dev \
+            libglu1-mesa-dev \
+            libasound2-dev
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify 100% ASCII compliance in src/lib.rs
+        shell: bash
+        run: |
+          if LC_ALL=C grep -n '[^[:print:][:space:]]' src/lib.rs; then
+            echo "ERROR: Non-ASCII characters detected in src/lib.rs!"
+            exit 1
+          fi
+          echo "ASCII check passed."
+
+      - name: Run DSP Unit Tests
+        run: cargo test --release
+
+      - name: Bundle VST3 and CLAP plugins
+        run: cargo run --package xtask --release -- bundle omore-punch --release
+
+      - name: Upload Bundled Plugins (VST3 + CLAP)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Omore-Punch-${{ matrix.artifact_suffix }}
+          path: |
+            target/bundled/omore-punch.vst3
+            target/bundled/omore-punch.clap

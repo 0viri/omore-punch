@@ -1,0 +1,39 @@
+diff --git a/src/plugin.rs b/src/plugin.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/plugin.rs
++++ b/src/plugin.rs
+@@ -195,6 +195,11 @@ pub trait Plugin: Default + Send + Sync + 'static {
+     fn reset(&mut self) {}
+ 
++    /// Returns the instantaneous gain adjustment in dB (negative for gain reduction, e.g. -4.8)
++    /// reported to hosts supporting `clap.gain-adjustment-metering/0` or VST3 `IGainReductionInfo`.
++    fn gain_adjustment_metering(&self) -> f64 {
++        0.0
++    }
++
+     fn process(
+         &mut self,
+diff --git a/src/wrapper/clap/wrapper.rs b/src/wrapper/clap/wrapper.rs
+index 4a5b6c7..8d9e0f1 100644
+--- a/src/wrapper/clap/wrapper.rs
++++ b/src/wrapper/clap/wrapper.rs
+@@ -15,6 +15,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
++pub const CLAP_EXT_GAIN_ADJUSTMENT_METERING: &CStr =
++    unsafe { CStr::from_bytes_with_nul_unchecked(b"clap.gain-adjustment-metering/0\0") };
++
++#[repr(C)]
++pub struct clap_plugin_gain_adjustment_metering {
++    pub get: Option<unsafe extern "C" fn(plugin: *const clap_plugin) -> f64>,
++}
++
+ impl<P: ClapPlugin> Wrapper<P> {
++    const GAIN_ADJUSTMENT_METERING_VTABLE: clap_plugin_gain_adjustment_metering =
++        clap_plugin_gain_adjustment_metering {
++            get: Some(Self::ext_gain_adjustment_metering_get),
++        };
++
++    unsafe extern "C" fn ext_gain_adjustment_metering_get(plugin: *const clap_plugin) -> f64 {
++        check_null_ptr!(0.0, plugin);
++        let wrapper = &*((*plugin).plugin_data as *const Self);
++        wrapper.plugin.lock().gain_adjustment_metering()
++    }
