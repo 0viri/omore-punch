@@ -3,6 +3,11 @@
 Toutes les modifications notables de ce projet sont documentées dans ce fichier.
 
 ## [Unreleased]
+### Corrigé
+- **Mise en page UI `egui` (`ui-columns-overlap`) :**
+  - Suppression du chevauchement entre la colonne de gauche (sections `1.` et `2.`) et la colonne de droite (`3. GAIN REDUCTION & STEREO BUS METERING`) qui tronquait les boutons `Reset`.
+  - Remplacement du partage rigide 50/50 (`ui.columns(2, ...)`) par deux colonnes asymétriques (`480 px` à gauche, `310 px` à droite) adaptées au contenu.
+  - Synchronisation de `ui.spacing_mut().slider_width` avec la largeur allouée au slider (`140 px`) dans `draw_param_row` pour éliminer les vides parasites entre `-`, le rail du slider et `+`, et ajustement de la hauteur de fenêtre (`820x480`) et des vu-mètres (`255 px`).
 
 ## [0.2.0] - 2026-10-16
 ### Ajouté

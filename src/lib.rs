@@ -451,7 +451,7 @@ pub struct OmorePunchParams {
 impl Default for OmorePunchParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(820, 560),
+            editor_state: EguiState::from_size(UI_WINDOW_WIDTH, UI_WINDOW_HEIGHT),
 
             input_db: FloatParam::new(
                 "Input Trim",
@@ -755,6 +755,18 @@ impl Plugin for OmorePunch {
 // EGUI User Interface (Dark Omore Style - 100% ASCII)
 // ----------------------------------------------------------------------------
 
+const UI_WINDOW_WIDTH: u32 = 820;
+const UI_WINDOW_HEIGHT: u32 = 480;
+const UI_LEFT_COL_WIDTH: f32 = 480.0;
+const UI_RIGHT_COL_WIDTH: f32 = 310.0;
+const UI_COL_GAP: f32 = 10.0;
+const UI_SLIDER_WIDTH: f32 = 140.0;
+const UI_STEP_BTN_WIDTH: f32 = 24.0;
+const UI_RESET_BTN_WIDTH: f32 = 48.0;
+const UI_ROW_HEIGHT: f32 = 22.0;
+const UI_ROW_ITEM_SPACING: f32 = 6.0;
+const UI_METER_HEIGHT: f32 = 255.0;
+
 fn apply_omore_dark_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = egui::Color32::from_rgb(18, 19, 24);
@@ -783,15 +795,17 @@ fn draw_param_row(
     let formatted_val = param.to_string();
 
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = UI_ROW_ITEM_SPACING;
+
         ui.label(
-            egui::RichText::new(format!("{:<14}", label))
+            egui::RichText::new(format!("{:<12}", label))
                 .monospace()
                 .strong()
                 .color(egui::Color32::from_rgb(220, 224, 232)),
         );
 
         if ui
-            .add_sized([28.0, 22.0], egui::Button::new("-"))
+            .add_sized([UI_STEP_BTN_WIDTH, UI_ROW_HEIGHT], egui::Button::new("-"))
             .on_hover_text("Decrease value")
             .clicked()
         {
@@ -802,8 +816,9 @@ fn draw_param_row(
         }
 
         let mut slider_val = current_val;
+        ui.spacing_mut().slider_width = UI_SLIDER_WIDTH;
         let slider_resp = ui.add_sized(
-            [210.0, 22.0],
+            [UI_SLIDER_WIDTH, UI_ROW_HEIGHT],
             egui::Slider::new(&mut slider_val, min_val..=max_val).show_value(false),
         );
 
@@ -818,7 +833,7 @@ fn draw_param_row(
         }
 
         if ui
-            .add_sized([28.0, 22.0], egui::Button::new("+"))
+            .add_sized([UI_STEP_BTN_WIDTH, UI_ROW_HEIGHT], egui::Button::new("+"))
             .on_hover_text("Increase value")
             .clicked()
         {
@@ -829,13 +844,13 @@ fn draw_param_row(
         }
 
         ui.label(
-            egui::RichText::new(format!("{:>10}", formatted_val))
+            egui::RichText::new(format!("{:>9}", formatted_val))
                 .monospace()
                 .color(egui::Color32::from_rgb(245, 185, 45)),
         );
 
         if ui
-            .add_sized([52.0, 22.0], egui::Button::new("Reset"))
+            .add_sized([UI_RESET_BTN_WIDTH, UI_ROW_HEIGHT], egui::Button::new("Reset"))
             .on_hover_text("Reset to default value")
             .clicked()
         {
@@ -1060,263 +1075,300 @@ fn draw_omore_punch_ui(
     });
 
     egui::CentralPanel::default().show(egui_ctx, |ui| {
-        ui.columns(2, |cols| {
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = UI_COL_GAP;
+
             // ================================================================
             // LEFT COLUMN: COMPRESSOR, CLIPPER & PARALLEL MIX CONTROLS
             // ================================================================
-            cols[0].group(|ui| {
-                ui.label(
-                    egui::RichText::new("1. COMPRESSOR & ENVELOPE BALLISTICS")
-                        .monospace()
-                        .strong()
-                        .color(egui::Color32::from_rgb(245, 185, 35)),
-                );
-                ui.separator();
+            ui.allocate_ui_with_layout(
+                egui::vec2(UI_LEFT_COL_WIDTH, ui.available_height()),
+                egui::Layout::top_down(egui::Align::Min),
+                |left_col| {
+                    left_col.set_width(UI_LEFT_COL_WIDTH);
 
-                draw_param_row(
-                    ui,
-                    setter,
-                    &params.input_db,
-                    "Input Drive",
-                    0.5,
-                    -12.0,
-                    12.0,
-                );
-                draw_param_row(
-                    ui,
-                    setter,
-                    &params.threshold_db,
-                    "Threshold",
-                    0.5,
-                    -40.0,
-                    0.0,
-                );
-                draw_param_row(ui, setter, &params.ratio, "Ratio", 0.25, 1.0, 20.0);
-                draw_param_row(ui, setter, &params.attack_ms, "Attack", 0.5, 0.1, 100.0);
-                draw_param_row(
-                    ui,
-                    setter,
-                    &params.release_ms,
-                    "Release",
-                    5.0,
-                    10.0,
-                    500.0,
-                );
-                draw_param_row(
-                    ui,
-                    setter,
-                    &params.sc_hpf_hz,
-                    "SC HPF",
-                    5.0,
-                    20.0,
-                    250.0,
-                );
-
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(
-                            egui::RichText::new("[Punch 3ms / 80ms]")
+                    left_col.group(|ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            egui::RichText::new("1. COMPRESSOR & ENVELOPE BALLISTICS")
                                 .monospace()
-                                .strong(),
-                        )
-                        .on_hover_text(
-                            "Set Omore Sampler signature Drum Bus Attack (3.0 ms) and Release (80.0 ms)",
-                        )
-                        .clicked()
-                    {
-                        setter.begin_set_parameter(&params.attack_ms);
-                        setter.set_parameter(&params.attack_ms, 3.0);
-                        setter.end_set_parameter(&params.attack_ms);
+                                .strong()
+                                .color(egui::Color32::from_rgb(245, 185, 35)),
+                        );
+                        ui.separator();
 
-                        setter.begin_set_parameter(&params.release_ms);
-                        setter.set_parameter(&params.release_ms, 80.0);
-                        setter.end_set_parameter(&params.release_ms);
-                    }
+                        draw_param_row(
+                            ui,
+                            setter,
+                            &params.input_db,
+                            "Input Drive",
+                            0.5,
+                            -12.0,
+                            12.0,
+                        );
+                        draw_param_row(
+                            ui,
+                            setter,
+                            &params.threshold_db,
+                            "Threshold",
+                            0.5,
+                            -40.0,
+                            0.0,
+                        );
+                        draw_param_row(ui, setter, &params.ratio, "Ratio", 0.25, 1.0, 20.0);
+                        draw_param_row(ui, setter, &params.attack_ms, "Attack", 0.5, 0.1, 100.0);
+                        draw_param_row(
+                            ui,
+                            setter,
+                            &params.release_ms,
+                            "Release",
+                            5.0,
+                            10.0,
+                            500.0,
+                        );
+                        draw_param_row(
+                            ui,
+                            setter,
+                            &params.sc_hpf_hz,
+                            "SC HPF",
+                            5.0,
+                            20.0,
+                            250.0,
+                        );
 
-                    if ui
-                        .button(
-                            egui::RichText::new("[Kick Safe 90Hz]")
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(
+                                    egui::RichText::new("[Punch 3ms / 80ms]")
+                                        .monospace()
+                                        .strong(),
+                                )
+                                .on_hover_text(
+                                    "Set Omore Sampler signature Drum Bus Attack (3.0 ms) and Release (80.0 ms)",
+                                )
+                                .clicked()
+                            {
+                                setter.begin_set_parameter(&params.attack_ms);
+                                setter.set_parameter(&params.attack_ms, 3.0);
+                                setter.end_set_parameter(&params.attack_ms);
+
+                                setter.begin_set_parameter(&params.release_ms);
+                                setter.set_parameter(&params.release_ms, 80.0);
+                                setter.end_set_parameter(&params.release_ms);
+                            }
+
+                            if ui
+                                .button(
+                                    egui::RichText::new("[Kick Safe 90Hz]")
+                                        .monospace()
+                                        .strong(),
+                                )
+                                .on_hover_text(
+                                    "Set Sidechain HPF to 90.0 Hz so Kick sub-bass (40-80 Hz) does not pump the Drum Bus",
+                                )
+                                .clicked()
+                            {
+                                setter.begin_set_parameter(&params.sc_hpf_hz);
+                                setter.set_parameter(&params.sc_hpf_hz, 90.0);
+                                setter.end_set_parameter(&params.sc_hpf_hz);
+                            }
+
+                            let auto_mk = params.auto_makeup.value();
+                            let auto_label = if auto_mk {
+                                "[Auto Makeup: ON]"
+                            } else {
+                                "[Auto Makeup: OFF]"
+                            };
+                            let auto_fill = if auto_mk {
+                                egui::Color32::from_rgb(195, 125, 20)
+                            } else {
+                                egui::Color32::from_rgb(45, 48, 58)
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(auto_label).monospace().strong(),
+                                    )
+                                    .fill(auto_fill),
+                                )
+                                .on_hover_text(
+                                    "Enable 35% automatic threshold/ratio gain compensation from Omore Sampler",
+                                )
+                                .clicked()
+                            {
+                                setter.begin_set_parameter(&params.auto_makeup);
+                                setter.set_parameter(&params.auto_makeup, !auto_mk);
+                                setter.end_set_parameter(&params.auto_makeup);
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        draw_param_row(
+                            ui,
+                            setter,
+                            &params.makeup_db,
+                            "Makeup Gain",
+                            0.5,
+                            -12.0,
+                            24.0,
+                        );
+                    });
+
+                    left_col.add_space(8.0);
+
+                    left_col.group(|ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            egui::RichText::new("2. OUTPUT CLIPPER & PARALLEL MIX")
                                 .monospace()
-                                .strong(),
-                        )
-                        .on_hover_text(
-                            "Set Sidechain HPF to 90.0 Hz so Kick sub-bass (40-80 Hz) does not pump the Drum Bus",
-                        )
-                        .clicked()
-                    {
-                        setter.begin_set_parameter(&params.sc_hpf_hz);
-                        setter.set_parameter(&params.sc_hpf_hz, 90.0);
-                        setter.end_set_parameter(&params.sc_hpf_hz);
-                    }
+                                .strong()
+                                .color(egui::Color32::from_rgb(245, 185, 35)),
+                        );
+                        ui.separator();
 
-                    let auto_mk = params.auto_makeup.value();
-                    let auto_label = if auto_mk {
-                        "[Auto Makeup: ON]"
-                    } else {
-                        "[Auto Makeup: OFF]"
-                    };
-                    let auto_fill = if auto_mk {
-                        egui::Color32::from_rgb(195, 125, 20)
-                    } else {
-                        egui::Color32::from_rgb(45, 48, 58)
-                    };
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(auto_label).monospace().strong(),
-                            )
-                            .fill(auto_fill),
-                        )
-                        .on_hover_text(
-                            "Enable 35% automatic threshold/ratio gain compensation from Omore Sampler",
-                        )
-                        .clicked()
-                    {
-                        setter.begin_set_parameter(&params.auto_makeup);
-                        setter.set_parameter(&params.auto_makeup, !auto_mk);
-                        setter.end_set_parameter(&params.auto_makeup);
-                    }
-                });
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Clipper Mode:")
+                                    .monospace()
+                                    .strong(),
+                            );
+                            let current_mode = params.clipper_mode.value();
+                            for (mode, text) in [
+                                (ClipperMode::SoftClip, "[Soft Clip]"),
+                                (ClipperMode::HardClip, "[Hard Clip]"),
+                                (ClipperMode::Bypass, "[Bypass]"),
+                            ] {
+                                let active = current_mode == mode;
+                                let fill = if active {
+                                    egui::Color32::from_rgb(195, 125, 20)
+                                } else {
+                                    egui::Color32::from_rgb(45, 48, 58)
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new(text).monospace().strong(),
+                                        )
+                                        .fill(fill),
+                                    )
+                                    .clicked()
+                                {
+                                    setter.begin_set_parameter(&params.clipper_mode);
+                                    setter.set_parameter(&params.clipper_mode, mode);
+                                    setter.end_set_parameter(&params.clipper_mode);
+                                }
+                            }
+                        });
 
-                ui.add_space(4.0);
-                draw_param_row(
-                    ui,
-                    setter,
-                    &params.makeup_db,
-                    "Makeup Gain",
-                    0.5,
-                    -12.0,
-                    24.0,
-                );
-            });
-
-            cols[0].add_space(8.0);
-
-            cols[0].group(|ui| {
-                ui.label(
-                    egui::RichText::new("2. OUTPUT CLIPPER & PARALLEL MIX")
-                        .monospace()
-                        .strong()
-                        .color(egui::Color32::from_rgb(245, 185, 35)),
-                );
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Clipper Mode:")
-                            .monospace()
-                            .strong(),
-                    );
-                    let current_mode = params.clipper_mode.value();
-                    for (mode, text) in [
-                        (ClipperMode::SoftClip, "[Soft Clip]"),
-                        (ClipperMode::HardClip, "[Hard Clip]"),
-                        (ClipperMode::Bypass, "[Bypass]"),
-                    ] {
-                        let active = current_mode == mode;
-                        let fill = if active {
-                            egui::Color32::from_rgb(195, 125, 20)
-                        } else {
-                            egui::Color32::from_rgb(45, 48, 58)
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(egui::RichText::new(text).monospace().strong())
-                                    .fill(fill),
-                            )
-                            .clicked()
-                        {
-                            setter.begin_set_parameter(&params.clipper_mode);
-                            setter.set_parameter(&params.clipper_mode, mode);
-                            setter.end_set_parameter(&params.clipper_mode);
-                        }
-                    }
-                });
-
-                ui.add_space(4.0);
-                draw_param_row(
-                    ui,
-                    setter,
-                    &params.ceiling_db,
-                    "Clip Ceiling",
-                    0.25,
-                    -6.0,
-                    0.0,
-                );
-                draw_param_row(
-                    ui,
-                    setter,
-                    &params.mix_pct,
-                    "Mix Dry/Wet",
-                    5.0,
-                    0.0,
-                    100.0,
-                );
-            });
+                        ui.add_space(4.0);
+                        draw_param_row(
+                            ui,
+                            setter,
+                            &params.ceiling_db,
+                            "Clip Ceiling",
+                            0.25,
+                            -6.0,
+                            0.0,
+                        );
+                        draw_param_row(
+                            ui,
+                            setter,
+                            &params.mix_pct,
+                            "Mix Dry/Wet",
+                            5.0,
+                            0.0,
+                            100.0,
+                        );
+                    });
+                },
+            );
 
             // ================================================================
             // RIGHT COLUMN: GAIN REDUCTION & STEREO IN/OUT METERS
             // ================================================================
-            cols[1].group(|ui| {
-                ui.label(
-                    egui::RichText::new("3. GAIN REDUCTION & STEREO BUS METERING")
-                        .monospace()
-                        .strong()
-                        .color(egui::Color32::from_rgb(245, 185, 35)),
-                );
-                ui.separator();
+            ui.allocate_ui_with_layout(
+                egui::vec2(UI_RIGHT_COL_WIDTH, ui.available_height()),
+                egui::Layout::top_down(egui::Align::Min),
+                |right_col| {
+                    right_col.set_width(UI_RIGHT_COL_WIDTH);
 
-                // Large ASCII Digital Readouts for Instant GR and Peak GR Hold
-                ui.horizontal(|ui| {
-                    ui.group(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("GR: -{:04.1} dB", current_gr_db))
-                                    .monospace()
-                                    .strong()
-                                    .size(21.0)
-                                    .color(egui::Color32::from_rgb(250, 195, 40)),
+                    right_col.group(|ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            egui::RichText::new("3. GAIN REDUCTION & STEREO BUS METERING")
+                                .monospace()
+                                .strong()
+                                .color(egui::Color32::from_rgb(245, 185, 35)),
+                        );
+                        ui.separator();
+
+                        // Large ASCII Digital Readouts for Instant GR and Peak GR Hold
+                        ui.horizontal(|ui| {
+                            ui.group(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "GR: -{:04.1} dB",
+                                            current_gr_db
+                                        ))
+                                        .monospace()
+                                        .strong()
+                                        .size(20.0)
+                                        .color(egui::Color32::from_rgb(250, 195, 40)),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Max GR: -{:04.1} dB",
+                                            max_gr_db
+                                        ))
+                                        .monospace()
+                                        .strong()
+                                        .size(15.0)
+                                        .color(egui::Color32::from_rgb(255, 125, 65)),
+                                    );
+                                });
+                            });
+
+                            ui.vertical(|ui| {
+                                if ui
+                                    .add_sized(
+                                        [112.0, 32.0],
+                                        egui::Button::new(
+                                            egui::RichText::new("[Reset Peak]")
+                                                .monospace()
+                                                .strong(),
+                                        ),
+                                    )
+                                    .on_hover_text(
+                                        "Reset Max Gain Reduction Hold and Clipper Latch",
+                                    )
+                                    .clicked()
+                                {
+                                    telemetry.reset_peaks();
+                                }
+                            });
+                        });
+
+                        ui.add_space(8.0);
+
+                        // Vertical Meters Row: In L/R, Out L/R, and Reaper-Style Top-Down GR Bar
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+                            draw_vertical_level_meter(ui, "In L/R", in_l, in_r, UI_METER_HEIGHT);
+                            ui.add_space(18.0);
+                            draw_reaper_style_gr_meter(
+                                ui,
+                                current_gr_db,
+                                max_gr_db,
+                                UI_METER_HEIGHT,
                             );
-                            ui.label(
-                                egui::RichText::new(format!("Max GR: -{:04.1} dB", max_gr_db))
-                                    .monospace()
-                                    .strong()
-                                    .size(16.0)
-                                    .color(egui::Color32::from_rgb(255, 125, 65)),
-                            );
+                            ui.add_space(18.0);
+                            draw_vertical_level_meter(ui, "Out L/R", out_l, out_r, UI_METER_HEIGHT);
                         });
                     });
-
-                    ui.vertical(|ui| {
-                        if ui
-                            .add_sized(
-                                [120.0, 32.0],
-                                egui::Button::new(
-                                    egui::RichText::new("[Reset Peak]").monospace().strong(),
-                                ),
-                            )
-                            .on_hover_text("Reset Max Gain Reduction Hold and Clipper Latch")
-                            .clicked()
-                        {
-                            telemetry.reset_peaks();
-                        }
-                    });
-                });
-
-                ui.add_space(8.0);
-
-                // Vertical Meters Row: In L/R, Out L/R, and Reaper-Style Top-Down GR Bar
-                let meter_height = 295.0;
-                ui.horizontal(|ui| {
-                    ui.add_space(12.0);
-                    draw_vertical_level_meter(ui, "In L/R", in_l, in_r, meter_height);
-                    ui.add_space(24.0);
-                    draw_reaper_style_gr_meter(ui, current_gr_db, max_gr_db, meter_height);
-                    ui.add_space(24.0);
-                    draw_vertical_level_meter(ui, "Out L/R", out_l, out_r, meter_height);
-                });
-            });
+                },
+            );
         });
     });
 
@@ -1632,5 +1684,41 @@ mod tests {
                 "Internal GR envelope became non-finite"
             );
         }
+    }
+
+    #[test]
+    fn test_ui_layout_column_widths_fit_window() {
+        // CentralPanel inner margins (8.0 px left + 8.0 px right)
+        let central_panel_margins = 16.0_f32;
+        let total_columns_width =
+            UI_LEFT_COL_WIDTH + UI_COL_GAP + UI_RIGHT_COL_WIDTH + central_panel_margins;
+        assert!(
+            total_columns_width <= UI_WINDOW_WIDTH as f32,
+            "Total columns width ({}) exceeds window width ({})",
+            total_columns_width,
+            UI_WINDOW_WIDTH
+        );
+
+        // Estimate draw_param_row width inside Group 1 / Group 2:
+        // 12-char monospace label (~96 px) + '-' button + slider + '+' button +
+        // 9-char monospace value (~72 px) + 'Reset' button + 5 item spacings + group margins (12 px)
+        let max_label_px = 12.0 * 8.0;
+        let max_value_px = 9.0 * 8.0;
+        let group_margins_px = 12.0;
+        let param_row_width = max_label_px
+            + UI_STEP_BTN_WIDTH
+            + UI_SLIDER_WIDTH
+            + UI_STEP_BTN_WIDTH
+            + max_value_px
+            + UI_RESET_BTN_WIDTH
+            + 5.0 * UI_ROW_ITEM_SPACING
+            + group_margins_px;
+
+        assert!(
+            param_row_width <= UI_LEFT_COL_WIDTH,
+            "Parameter row width ({}) overflows left column width ({})",
+            param_row_width,
+            UI_LEFT_COL_WIDTH
+        );
     }
 }
