@@ -59,7 +59,7 @@ Ce fichier définit les règles d'architecture, de DSP temps réel, d'interface 
 - **Style & Palette (`apply_omore_dark_theme`) :**
   - Thème sombre inspiré d'`Omore Sampler` : fond de panneau `rgb(18, 19, 24)`, fond de fenêtre `rgb(24, 26, 32)`, fond extrême/jauges `rgb(10, 11, 14)`, widgets inactifs `rgb(38, 41, 52)`, survol `rgb(56, 61, 78)`, accentuation ambre/or `rgb(225, 145, 25)` / `rgb(245, 185, 35)`.
 - **Texte & Typographie :**
-  - 100 % ASCII strict (règle 2.2) avec police `monospace()` pour les étiquettes de paramètres, valeurs numériques et boutons d'action entre crochets (`[Punch 3ms / 80ms]`, `[Kick Safe 90Hz]`, `[Auto Makeup: ON]`, `[Soft Clip]`, `[Reset Peak]`, `[CLIP: OK]`).
+  - 100 % ASCII strict (règle 2.2) avec police `monospace()` pour les étiquettes de paramètres, valeurs numériques et boutons d'action entre crochets (`[Punch 3ms / 80ms]`, `[Snare Safe 200Hz]`, `[Auto Makeup: ON]`, `[Soft Clip]`, `[Reset Peak]`, `[CLIP: OK]`).
 - **Structure en 2 Colonnes & En-tête :**
   - Bandeau supérieur (`TopBottomPanel::top`) affichant `OMORE PUNCH v<VERSION>  |  STEREO DRUM BUS COMPRESSOR & CLIPPER` à gauche et le témoin/bouton d'acquittement `[CLIP: OK]` / `[CLIP: ACTIVE - CLICK TO RESET]` à droite.
   - Colonne gauche dédiée aux contrôles (`1. COMPRESSOR & ENVELOPE BALLISTICS` et `2. OUTPUT CLIPPER & PARALLEL MIX`), chaque paramètre utilisant `draw_param_row` (label aligné, bouton `-`, slider, bouton `+`, lecture numérique formatée, bouton `Reset` encadré par `begin_set_parameter` / `set_parameter` / `end_set_parameter`).

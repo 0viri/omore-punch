@@ -8,7 +8,7 @@ Il extrait et adapte en bus stéréo lié l'algorithme de dynamique "Punch" et l
 
 - **Formats exportés :** `VST3` et `CLAP`.
 - **Détecteur de Crête Stéréo Lié (Stereo-Linked Peak Detector) :** Conserve une image stéréo parfaitement stable pour la caisse claire, la grosse caisse et les overheads.
-- **Filtre Passe-Haut de Sidechain Interne (`SC HPF` de `20 Hz` à `250 Hz`) :** Filtre 6 dB/oct dédié uniquement au détecteur avec bouton rapide `[Kick Safe 90Hz]` pour éviter que le sub de la grosse caisse ne fasse pomper le bus, sans aucune perte de grave dans le signal audio.
+- **Filtre Passe-Haut de Sidechain Interne (`SC HPF` de `20 Hz` à `250 Hz`) :** Filtre 6 dB/oct dédié uniquement au détecteur avec bouton rapide `[Snare Safe 200Hz]` pour éviter que le grave de la grosse caisse et le corps de la caisse claire ne fassent pomper le bus, sans aucune perte de grave dans le signal audio.
 - **Balistique "Omore Punch" :** Pré-réglage signature rapide (`Attack = 3.0 ms`, `Release = 80.0 ms`) accessible en un clic via `[Punch 3ms / 80ms]`.
 - **Compensation Auto-Makeup (35 %) :** Redonne instantanément du corps dès que l'on abaisse le `Threshold`, complétée par un `Makeup Gain` manuel (`-12 dB` à `+24 dB`).
 - **Étage Clipper Final :** 3 modes (`Soft Clip` cubique/tanh $C^1$ sans perte à faible niveau, `Hard Clip`, ou `Bypass`) avec plafond `Clip Ceiling` ajustable de `-6.0 dB` à `0.0 dB`.
