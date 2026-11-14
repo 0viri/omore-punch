@@ -3,6 +3,10 @@
 Toutes les modifications notables de ce projet sont documentées dans ce fichier.
 
 ## [Unreleased]
+### Modifié
+- **Bouton Rapide `[Snare Safe 200Hz]` dans l'interface `egui` (`001-snare-safe-200hz`) :**
+  - Remplacement du bouton rapide `[Kick Safe 90Hz]` par `[Snare Safe 200Hz]` réglant `SC HPF` sur `200.0 Hz` en un clic (technique Cristian Kohle) afin que ni le sous-grave de la grosse caisse ni le corps de la caisse claire ne fassent pomper le bus batterie.
+
 ### Corrigé
 - **Mise en page UI `egui` (`ui-columns-overlap`) :**
   - Suppression du chevauchement entre la colonne de gauche (sections `1.` et `2.`) et la colonne de droite (`3. GAIN REDUCTION & STEREO BUS METERING`) qui tronquait les boutons `Reset`.

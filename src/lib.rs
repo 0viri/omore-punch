@@ -1160,17 +1160,17 @@ fn draw_omore_punch_ui(
 
                             if ui
                                 .button(
-                                    egui::RichText::new("[Kick Safe 90Hz]")
+                                    egui::RichText::new("[Snare Safe 200Hz]")
                                         .monospace()
                                         .strong(),
                                 )
                                 .on_hover_text(
-                                    "Set Sidechain HPF to 90.0 Hz so Kick sub-bass (40-80 Hz) does not pump the Drum Bus",
+                                    "Set Sidechain HPF to 200.0 Hz so Kick and Snare body (up to 200 Hz) do not pump the Drum Bus",
                                 )
                                 .clicked()
                             {
                                 setter.begin_set_parameter(&params.sc_hpf_hz);
-                                setter.set_parameter(&params.sc_hpf_hz, 90.0);
+                                setter.set_parameter(&params.sc_hpf_hz, 200.0);
                                 setter.end_set_parameter(&params.sc_hpf_hz);
                             }
 
@@ -1527,6 +1527,70 @@ mod tests {
             peak_out_filtered > peak_out_unfiltered * 1.5,
             "Expected SC HPF @ 150 Hz to preserve much more sub-bass amplitude in main audio path: peak_out_filtered={:.3} vs peak_out_unfiltered={:.3}",
             peak_out_filtered,
+            peak_out_unfiltered
+        );
+    }
+
+    #[test]
+    fn test_sidechain_hpf_snare_safe_200hz() {
+        let sample_rate = 48000.0_f32;
+        let snare_body_freq_hz = 100.0_f32;
+        let snare_amp = 0.8_f32;
+
+        let mut dsp_unfiltered = StereoPunchDsp::new(sample_rate);
+        let mut dsp_snare_safe = StereoPunchDsp::new(sample_rate);
+
+        let cfg_unfiltered = DspConfig {
+            input_db: 0.0,
+            threshold_db: -18.0,
+            ratio: 4.0,
+            attack_ms: 3.0,
+            release_ms: 80.0,
+            sc_hpf_hz: 20.0,
+            auto_makeup: false,
+            makeup_db: 0.0,
+            clipper_mode: ClipperMode::Bypass,
+            ceiling_db: 0.0,
+            mix_pct: 100.0,
+        };
+
+        let cfg_snare_safe = DspConfig {
+            sc_hpf_hz: 200.0,
+            ..cfg_unfiltered
+        };
+
+        let mut gr_unfiltered = 0.0_f32;
+        let mut gr_snare_safe = 0.0_f32;
+        let mut peak_out_unfiltered = 0.0_f32;
+        let mut peak_out_snare_safe = 0.0_f32;
+
+        let total_samples = 24000;
+        for n in 0..total_samples {
+            let phase =
+                2.0 * std::f32::consts::PI * snare_body_freq_hz * (n as f32) / sample_rate;
+            let s = snare_amp * phase.sin();
+
+            let out_u = dsp_unfiltered.process_sample(s, s, &cfg_unfiltered);
+            let out_s = dsp_snare_safe.process_sample(s, s, &cfg_snare_safe);
+
+            if n > total_samples / 2 {
+                gr_unfiltered = gr_unfiltered.max(out_u.gr_db);
+                gr_snare_safe = gr_snare_safe.max(out_s.gr_db);
+                peak_out_unfiltered = peak_out_unfiltered.max(out_u.out_l.abs());
+                peak_out_snare_safe = peak_out_snare_safe.max(out_s.out_l.abs());
+            }
+        }
+
+        assert!(
+            gr_snare_safe < gr_unfiltered - 4.0,
+            "Expected SC HPF @ 200 Hz (Snare Safe) to significantly reduce low-mid GR: gr_snare_safe={:.2} dB vs gr_unfiltered={:.2} dB",
+            gr_snare_safe,
+            gr_unfiltered
+        );
+        assert!(
+            peak_out_snare_safe > peak_out_unfiltered * 1.5,
+            "Expected SC HPF @ 200 Hz (Snare Safe) to preserve much more body amplitude in main audio path: peak_out_snare_safe={:.3} vs peak_out_unfiltered={:.3}",
+            peak_out_snare_safe,
             peak_out_unfiltered
         );
     }

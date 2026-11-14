@@ -12,7 +12,7 @@ Copie les bundles générés depuis `target/bundled/` vers ton dossier de plugin
 ## 2. Réglage Rapide pour un Bus Batterie Metal / Rock
 1. Insère **Omore Punch** sur ta piste dossier/bus `DRUM BUS` dans Reaper.
 2. Clique sur le bouton **`[Punch 3ms / 80ms]`** pour verrouiller l'attaque de `3.0 ms` (laisse passer le "crack" de la caisse claire et le clic de la grosse caisse) et le relâchement de `80.0 ms` (fait respirer le bus entre chaque coup).
-3. Clique sur le bouton **`[Kick Safe 90Hz]`** (ou règle **`SC HPF`** entre `80 Hz` et `120 Hz`) pour filtrer l'énergie sub-grave de la grosse caisse uniquement dans le détecteur du compresseur : le bus ne pompera plus sur les cymbales lors des coups de double pédale, tout en conservant 100 % des sub-basses dans le signal audio.
+3. Clique sur le bouton **`[Snare Safe 200Hz]`** (ou règle **`SC HPF`** jusqu'à `200 Hz`, selon la technique de Cristian Kohle) pour filtrer le sous-grave de la grosse caisse et le corps fondamental de la caisse claire uniquement dans le détecteur du compresseur : le bus ne pompera plus lors des coups de double pédale ou des impacts lourds de caisse claire, tout en conservant 100 % des graves et du corps dans le signal audio.
 4. Vérifie que **`[Auto Makeup: ON]`** est activé.
 5. Abaisse progressivement le **`Threshold`** jusqu'à lire une réduction de gain (`GR`) comprise entre **`-4.0 dB` et `-8.0 dB`** sur les impacts de caisse claire dans la grande jauge jaune descendante.
 6. Sélectionne **`[Soft Clip]`** et règle **`Clip Ceiling`** sur **`-0.5 dB`** ou **`-1.0 dB`** pour raboter musicalement les transitoires résiduelles sans faire saturer le convertisseur ou le bus Master.
