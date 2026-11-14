@@ -3,3 +3,8 @@
 *.swp
 *.bak
 .DS_Store
+.specify/feature.json
+*.vst3
+*.clap
+*.so
+*.dll

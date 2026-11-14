@@ -2,6 +2,8 @@
 
 Toutes les modifications notables de ce projet sont documentées dans ce fichier.
 
+## [Unreleased]
+
 ## [0.2.0] - 2026-10-16
 ### Ajouté
 - **Filtre Passe-Haut de Sidechain Interne (`SC HPF`, `20.0 Hz` à `250.0 Hz`) :**
