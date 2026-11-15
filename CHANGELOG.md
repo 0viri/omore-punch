@@ -3,6 +3,8 @@
 Toutes les modifications notables de ce projet sont documentées dans ce fichier.
 
 ## [Unreleased]
+
+## [0.3.0] - 2026-11-14
 ### Ajouté
 - **Section EQ 3 bandes pour Bus Batterie `3. DRUM BUS EQ` (`003-drum-bus-eq`) :**
   - Ajout d'un égaliseur stéréo apparié en série (biquads Direct Form II Transposed précalculés et mis en cache, placés post-compresseur et immédiatement pré-clipper) limité à trois contrôles : **`Low Cut`** (passe-haut Butterworth 12 dB/oct de `20.0 Hz` à `160.0 Hz`, bypass strict `<= 20.5 Hz`), **`500Hz Cut`** (peaking atténuateur à `500 Hz`, $Q = 1.0$, `0.0 dB` à `-12.0 dB`) et **`High Shelf`** (plateau haut à `10 kHz`, $S = 1.0$, `-6.0 dB` à `+12.0 dB`).
