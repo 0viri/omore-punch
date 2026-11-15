@@ -59,19 +59,19 @@ if (Test-WritableDirectory $systemClapRoot) {
     Write-Host "      Destination CLAP : Utilisateur ($targetClapRoot)" -ForegroundColor Yellow
 }
 
-$destVst3 = Join-Path $targetVst3Root "omore-punch.vst3"
-$destClap = Join-Path $targetClapRoot "omore-punch.clap"
+$legacyVst3 = Join-Path $targetVst3Root "omore-punch.vst3"
+$legacyClap = Join-Path $targetClapRoot "omore-punch.clap"
+$destVst3   = Join-Path $targetVst3Root "Omore Punch.vst3"
+$destClap   = Join-Path $targetClapRoot "Omore Punch.clap"
 
 try {
-    if (Test-Path $destVst3) {
-        Remove-Item -Recurse -Force $destVst3 -ErrorAction Stop
+    foreach ($oldPath in @($legacyVst3, $legacyClap, $destVst3, $destClap)) {
+        if (Test-Path -LiteralPath $oldPath) {
+            Remove-Item -LiteralPath $oldPath -Recurse -Force -ErrorAction Stop
+        }
     }
-    Copy-Item -Recurse -Force "target\bundled\omore-punch.vst3" $destVst3 -ErrorAction Stop
-
-    if (Test-Path $destClap) {
-        Remove-Item -Recurse -Force $destClap -ErrorAction Stop
-    }
-    Copy-Item -Recurse -Force "target\bundled\omore-punch.clap" $destClap -ErrorAction Stop
+    Copy-Item -LiteralPath "target\bundled\Omore Punch.vst3" -Destination $destVst3 -Recurse -Force -ErrorAction Stop
+    Copy-Item -LiteralPath "target\bundled\Omore Punch.clap" -Destination $destClap -Recurse -Force -ErrorAction Stop
 } catch {
     Write-Error "Impossible de copier les bundles. Verifiez que Reaper n'est pas en cours d'execution avec le plugin charge !"
     exit 1
