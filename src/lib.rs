@@ -75,6 +75,82 @@ pub enum ClipperMode {
 // ----------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
+struct BiquadCoeffs {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    bypass: bool,
+}
+
+impl Default for BiquadCoeffs {
+    fn default() -> Self {
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            bypass: true,
+        }
+    }
+}
+
+#[inline(always)]
+fn sanitize_biquad_state(s: f32) -> f32 {
+    if s.is_finite() && s.abs() > 1.0e-20 {
+        s
+    } else {
+        0.0
+    }
+}
+
+/// Stereo Direct Form II Transposed biquad with per-sample NaN/Inf and denormal protection.
+#[derive(Clone, Debug, Default)]
+struct StereoBiquad {
+    coeffs: BiquadCoeffs,
+    z1_l: f32,
+    z2_l: f32,
+    z1_r: f32,
+    z2_r: f32,
+}
+
+impl StereoBiquad {
+    #[inline(always)]
+    fn reset(&mut self) {
+        self.z1_l = 0.0;
+        self.z2_l = 0.0;
+        self.z1_r = 0.0;
+        self.z2_r = 0.0;
+    }
+
+    #[inline(always)]
+    fn process_channel(x: f32, coeffs: &BiquadCoeffs, z1: &mut f32, z2: &mut f32) -> f32 {
+        let clean_x = if x.is_finite() { x } else { 0.0 };
+        let raw_y = coeffs.b0 * clean_x + *z1;
+        let y = if raw_y.is_finite() { raw_y } else { 0.0 };
+        let next_z1 = coeffs.b1 * clean_x - coeffs.a1 * y + *z2;
+        let next_z2 = coeffs.b2 * clean_x - coeffs.a2 * y;
+        *z1 = sanitize_biquad_state(next_z1);
+        *z2 = sanitize_biquad_state(next_z2);
+        y
+    }
+
+    #[inline(always)]
+    fn process_sample(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        if self.coeffs.bypass {
+            self.reset();
+            return (in_l, in_r);
+        }
+
+        let out_l = Self::process_channel(in_l, &self.coeffs, &mut self.z1_l, &mut self.z2_l);
+        let out_r = Self::process_channel(in_r, &self.coeffs, &mut self.z1_r, &mut self.z2_r);
+        (out_l, out_r)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct DspConfig {
     pub input_db: f32,
     pub threshold_db: f32,
@@ -84,6 +160,9 @@ pub struct DspConfig {
     pub sc_hpf_hz: f32,
     pub auto_makeup: bool,
     pub makeup_db: f32,
+    pub eq_low_cut_hz: f32,
+    pub eq_mid_cut_db: f32,
+    pub eq_high_shelf_db: f32,
     pub clipper_mode: ClipperMode,
     pub ceiling_db: f32,
     pub mix_pct: f32,
@@ -100,6 +179,9 @@ impl Default for DspConfig {
             sc_hpf_hz: 20.0,
             auto_makeup: true,
             makeup_db: 0.0,
+            eq_low_cut_hz: 20.0,
+            eq_mid_cut_db: 0.0,
+            eq_high_shelf_db: 0.0,
             clipper_mode: ClipperMode::SoftClip,
             ceiling_db: 0.0,
             mix_pct: 100.0,
@@ -128,6 +210,12 @@ pub struct StereoPunchDsp {
     sc_prev_in_r: f32,
     sc_prev_out_l: f32,
     sc_prev_out_r: f32,
+    eq_low_cut: StereoBiquad,
+    eq_mid_cut: StereoBiquad,
+    eq_high_shelf: StereoBiquad,
+    cached_eq_low_cut_hz: f32,
+    cached_eq_mid_cut_db: f32,
+    cached_eq_high_shelf_db: f32,
     pub env_gr_db: f32,
 }
 
@@ -145,10 +233,17 @@ impl Default for StereoPunchDsp {
             sc_prev_in_r: 0.0,
             sc_prev_out_l: 0.0,
             sc_prev_out_r: 0.0,
+            eq_low_cut: StereoBiquad::default(),
+            eq_mid_cut: StereoBiquad::default(),
+            eq_high_shelf: StereoBiquad::default(),
+            cached_eq_low_cut_hz: -1.0,
+            cached_eq_mid_cut_db: -999.0,
+            cached_eq_high_shelf_db: -999.0,
             env_gr_db: 0.0,
         };
         dsp.update_ballistics(48000.0, 3.0, 80.0);
         dsp.update_sidechain_hpf(48000.0, 20.0);
+        dsp.update_eq(48000.0, 20.0, 0.0, 0.0);
         dsp
     }
 }
@@ -167,6 +262,9 @@ impl StereoPunchDsp {
         self.sc_prev_in_r = 0.0;
         self.sc_prev_out_l = 0.0;
         self.sc_prev_out_r = 0.0;
+        self.eq_low_cut.reset();
+        self.eq_mid_cut.reset();
+        self.eq_high_shelf.reset();
     }
 
     #[inline(always)]
@@ -177,11 +275,26 @@ impl StereoPunchDsp {
             let att = self.cached_attack_ms.max(0.1);
             let rel = self.cached_release_ms.max(10.0);
             let hpf = self.cached_sc_hpf_hz.clamp(20.0, 250.0);
+            let eq_lc = self.cached_eq_low_cut_hz.clamp(20.0, 160.0);
+            let eq_mc = if self.cached_eq_mid_cut_db < -100.0 {
+                0.0
+            } else {
+                self.cached_eq_mid_cut_db.clamp(-12.0, 0.0)
+            };
+            let eq_hs = if self.cached_eq_high_shelf_db < -100.0 {
+                0.0
+            } else {
+                self.cached_eq_high_shelf_db.clamp(-6.0, 12.0)
+            };
             self.cached_attack_ms = -1.0;
             self.cached_release_ms = -1.0;
             self.cached_sc_hpf_hz = -1.0;
+            self.cached_eq_low_cut_hz = -1.0;
+            self.cached_eq_mid_cut_db = -999.0;
+            self.cached_eq_high_shelf_db = -999.0;
             self.update_ballistics(sr, att, rel);
             self.update_sidechain_hpf(sr, hpf);
+            self.update_eq(sr, eq_lc, eq_mc, eq_hs);
         }
     }
 
@@ -194,6 +307,9 @@ impl StereoPunchDsp {
 
         if sr_changed {
             self.cached_sc_hpf_hz = -1.0;
+            self.cached_eq_low_cut_hz = -1.0;
+            self.cached_eq_mid_cut_db = -999.0;
+            self.cached_eq_high_shelf_db = -999.0;
         }
 
         if sr_changed || att_changed {
@@ -218,12 +334,169 @@ impl StereoPunchDsp {
         let sr_changed = (sr - self.sample_rate).abs() > 1e-3;
         let hpf_changed = (clamped_hz - self.cached_sc_hpf_hz).abs() > 1e-4;
 
+        if sr_changed {
+            self.cached_attack_ms = -1.0;
+            self.cached_release_ms = -1.0;
+            self.cached_eq_low_cut_hz = -1.0;
+            self.cached_eq_mid_cut_db = -999.0;
+            self.cached_eq_high_shelf_db = -999.0;
+        }
+
         if sr_changed || hpf_changed {
             self.sample_rate = sr;
             self.cached_sc_hpf_hz = clamped_hz;
             let rc = 1.0 / (2.0 * std::f32::consts::PI * clamped_hz);
             let dt = 1.0 / sr;
             self.sc_hpf_coeff = rc / (rc + dt);
+        }
+    }
+
+    #[inline(always)]
+    fn normalize_biquad_coeffs(
+        b0: f32,
+        b1: f32,
+        b2: f32,
+        a0: f32,
+        a1: f32,
+        a2: f32,
+    ) -> BiquadCoeffs {
+        if !a0.is_finite() || a0.abs() < 1.0e-12 {
+            return BiquadCoeffs::default();
+        }
+        let inv_a0 = 1.0 / a0;
+        BiquadCoeffs {
+            b0: b0 * inv_a0,
+            b1: b1 * inv_a0,
+            b2: b2 * inv_a0,
+            a1: a1 * inv_a0,
+            a2: a2 * inv_a0,
+            bypass: false,
+        }
+    }
+
+    /// 2nd-order Butterworth high-pass filter (12 dB/oct, Q = 1/sqrt(2)), bypassed <= 20.5 Hz.
+    #[inline(always)]
+    fn calc_low_cut_coeffs(sample_rate: f32, low_cut_hz: f32) -> BiquadCoeffs {
+        if low_cut_hz <= 20.5 {
+            return BiquadCoeffs::default();
+        }
+        let fc = low_cut_hz.min(0.45 * sample_rate);
+        let w0 = 2.0 * std::f32::consts::PI * fc / sample_rate;
+        let cos_w0 = w0.cos();
+        let sin_w0 = w0.sin();
+        let q = std::f32::consts::FRAC_1_SQRT_2;
+        let alpha = sin_w0 / (2.0 * q);
+        let one_plus_cos = 1.0 + cos_w0;
+        Self::normalize_biquad_coeffs(
+            0.5 * one_plus_cos,
+            -one_plus_cos,
+            0.5 * one_plus_cos,
+            1.0 + alpha,
+            -2.0 * cos_w0,
+            1.0 - alpha,
+        )
+    }
+
+    /// Peaking EQ cut centered at 500 Hz (Q = 1.0), bypassed when |gain| < 1e-3 dB.
+    #[inline(always)]
+    fn calc_mid_cut_coeffs(sample_rate: f32, mid_cut_db: f32) -> BiquadCoeffs {
+        if mid_cut_db.abs() < 1.0e-3 {
+            return BiquadCoeffs::default();
+        }
+        let fc = 500.0_f32.min(0.45 * sample_rate);
+        let q = 1.0_f32;
+        let a = 10.0_f32.powf(mid_cut_db * 0.025);
+        let w0 = 2.0 * std::f32::consts::PI * fc / sample_rate;
+        let cos_w0 = w0.cos();
+        let sin_w0 = w0.sin();
+        let alpha = sin_w0 / (2.0 * q);
+        Self::normalize_biquad_coeffs(
+            1.0 + alpha * a,
+            -2.0 * cos_w0,
+            1.0 - alpha * a,
+            1.0 + alpha / a,
+            -2.0 * cos_w0,
+            1.0 - alpha / a,
+        )
+    }
+
+    /// 2nd-order High-Shelf filter centered at 10 kHz (S = 1.0), bypassed when |gain| < 1e-3 dB.
+    #[inline(always)]
+    fn calc_high_shelf_coeffs(sample_rate: f32, high_shelf_db: f32) -> BiquadCoeffs {
+        if high_shelf_db.abs() < 1.0e-3 {
+            return BiquadCoeffs::default();
+        }
+        let fc = 10000.0_f32.min(0.45 * sample_rate);
+        let s = 1.0_f32;
+        let a = 10.0_f32.powf(high_shelf_db * 0.025);
+        let w0 = 2.0 * std::f32::consts::PI * fc / sample_rate;
+        let cos_w0 = w0.cos();
+        let sin_w0 = w0.sin();
+        let slope_term = ((a + 1.0 / a) * (1.0 / s - 1.0) + 2.0).max(0.0);
+        let alpha = 0.5 * sin_w0 * slope_term.sqrt();
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+        let a_plus_1 = a + 1.0;
+        let a_minus_1 = a - 1.0;
+        Self::normalize_biquad_coeffs(
+            a * (a_plus_1 + a_minus_1 * cos_w0 + two_sqrt_a_alpha),
+            -2.0 * a * (a_minus_1 + a_plus_1 * cos_w0),
+            a * (a_plus_1 + a_minus_1 * cos_w0 - two_sqrt_a_alpha),
+            a_plus_1 - a_minus_1 * cos_w0 + two_sqrt_a_alpha,
+            2.0 * (a_minus_1 - a_plus_1 * cos_w0),
+            a_plus_1 - a_minus_1 * cos_w0 - two_sqrt_a_alpha,
+        )
+    }
+
+    /// Updates the 3-band Drum Bus EQ coefficients only when sample rate or a parameter changes.
+    #[inline(always)]
+    pub fn update_eq(
+        &mut self,
+        sample_rate: f32,
+        low_cut_hz: f32,
+        mid_cut_db: f32,
+        high_shelf_db: f32,
+    ) {
+        let sr = sample_rate.max(8000.0);
+        let sr_changed = (sr - self.sample_rate).abs() > 1e-3;
+        if sr_changed {
+            self.sample_rate = sr;
+            self.cached_attack_ms = -1.0;
+            self.cached_release_ms = -1.0;
+            self.cached_sc_hpf_hz = -1.0;
+            self.cached_eq_low_cut_hz = -1.0;
+            self.cached_eq_mid_cut_db = -999.0;
+            self.cached_eq_high_shelf_db = -999.0;
+        }
+
+        let lc_hz = if low_cut_hz.is_finite() {
+            low_cut_hz.clamp(20.0, 160.0)
+        } else {
+            20.0
+        };
+        let mc_db = if mid_cut_db.is_finite() {
+            mid_cut_db.clamp(-12.0, 0.0)
+        } else {
+            0.0
+        };
+        let hs_db = if high_shelf_db.is_finite() {
+            high_shelf_db.clamp(-6.0, 12.0)
+        } else {
+            0.0
+        };
+
+        if (lc_hz - self.cached_eq_low_cut_hz).abs() > 1.0e-4 {
+            self.cached_eq_low_cut_hz = lc_hz;
+            self.eq_low_cut.coeffs = Self::calc_low_cut_coeffs(sr, lc_hz);
+        }
+
+        if (mc_db - self.cached_eq_mid_cut_db).abs() > 1.0e-4 {
+            self.cached_eq_mid_cut_db = mc_db;
+            self.eq_mid_cut.coeffs = Self::calc_mid_cut_coeffs(sr, mc_db);
+        }
+
+        if (hs_db - self.cached_eq_high_shelf_db).abs() > 1.0e-4 {
+            self.cached_eq_high_shelf_db = hs_db;
+            self.eq_high_shelf.coeffs = Self::calc_high_shelf_coeffs(sr, hs_db);
         }
     }
 
@@ -257,9 +530,15 @@ impl StereoPunchDsp {
         let dry_l = sanitize_sample(raw_l);
         let dry_r = sanitize_sample(raw_r);
 
-        // Update envelope and sidechain filter coefficients only if parameters changed
+        // Update envelope, sidechain filter and EQ coefficients only if parameters changed
         self.update_ballistics(self.sample_rate, cfg.attack_ms, cfg.release_ms);
         self.update_sidechain_hpf(self.sample_rate, cfg.sc_hpf_hz);
+        self.update_eq(
+            self.sample_rate,
+            cfg.eq_low_cut_hz,
+            cfg.eq_mid_cut_db,
+            cfg.eq_high_shelf_db,
+        );
 
         // 1. Input Trim (Drive)
         let input_gain = db_to_lin(cfg.input_db);
@@ -332,23 +611,28 @@ impl StereoPunchDsp {
         let comp_l = driven_l * comp_gain;
         let comp_r = driven_r * comp_gain;
 
+        // 5b. Drum Bus EQ (Low Cut -> 500Hz Cut -> High Shelf, immediately pre-clipper)
+        let (eq_l, eq_r) = self.eq_low_cut.process_sample(comp_l, comp_r);
+        let (eq_l, eq_r) = self.eq_mid_cut.process_sample(eq_l, eq_r);
+        let (eq_l, eq_r) = self.eq_high_shelf.process_sample(eq_l, eq_r);
+
         // 6. Final Clipper Stage (Soft Knee Saturation + Hard Ceiling)
         let ceiling_lin = db_to_lin(cfg.ceiling_db).max(1.0e-4);
         let (wet_l, wet_r, clipped) = match cfg.clipper_mode {
             ClipperMode::SoftClip => {
-                let (cl_l, over_l) = Self::soft_clip_channel(comp_l, ceiling_lin);
-                let (cl_r, over_r) = Self::soft_clip_channel(comp_r, ceiling_lin);
+                let (cl_l, over_l) = Self::soft_clip_channel(eq_l, ceiling_lin);
+                let (cl_r, over_r) = Self::soft_clip_channel(eq_r, ceiling_lin);
                 (cl_l, cl_r, over_l || over_r)
             }
             ClipperMode::HardClip => {
-                let over = comp_l.abs() > ceiling_lin || comp_r.abs() > ceiling_lin;
+                let over = eq_l.abs() > ceiling_lin || eq_r.abs() > ceiling_lin;
                 (
-                    comp_l.clamp(-ceiling_lin, ceiling_lin),
-                    comp_r.clamp(-ceiling_lin, ceiling_lin),
+                    eq_l.clamp(-ceiling_lin, ceiling_lin),
+                    eq_r.clamp(-ceiling_lin, ceiling_lin),
                     over,
                 )
             }
-            ClipperMode::Bypass => (comp_l, comp_r, false),
+            ClipperMode::Bypass => (eq_l, eq_r, false),
         };
 
         // 7. Parallel Mix (Dry / Wet %)
@@ -436,6 +720,15 @@ pub struct OmorePunchParams {
 
     #[id = "makeup_db"]
     pub makeup_db: FloatParam,
+
+    #[id = "eq_low_cut_hz"]
+    pub eq_low_cut_hz: FloatParam,
+
+    #[id = "eq_mid_cut_db"]
+    pub eq_mid_cut_db: FloatParam,
+
+    #[id = "eq_high_shelf_db"]
+    pub eq_high_shelf_db: FloatParam,
 
     #[id = "clipper_mode"]
     pub clipper_mode: EnumParam<ClipperMode>,
@@ -541,6 +834,43 @@ impl Default for OmorePunchParams {
                 FloatRange::Linear {
                     min: -12.0,
                     max: 24.0,
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0))
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            eq_low_cut_hz: FloatParam::new(
+                "EQ Low Cut",
+                20.0,
+                FloatRange::Skewed {
+                    min: 20.0,
+                    max: 160.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0))
+            .with_unit(" Hz")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+
+            eq_mid_cut_db: FloatParam::new(
+                "EQ 500Hz Cut",
+                0.0,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 0.0,
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0))
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            eq_high_shelf_db: FloatParam::new(
+                "EQ High Shelf",
+                0.0,
+                FloatRange::Linear {
+                    min: -6.0,
+                    max: 12.0,
                 },
             )
             .with_smoother(SmoothingStyle::Linear(5.0))
@@ -703,6 +1033,9 @@ impl Plugin for OmorePunch {
                 sc_hpf_hz: self.params.sc_hpf_hz.smoothed.next(),
                 auto_makeup,
                 makeup_db: self.params.makeup_db.smoothed.next(),
+                eq_low_cut_hz: self.params.eq_low_cut_hz.smoothed.next(),
+                eq_mid_cut_db: self.params.eq_mid_cut_db.smoothed.next(),
+                eq_high_shelf_db: self.params.eq_high_shelf_db.smoothed.next(),
                 clipper_mode,
                 ceiling_db: self.params.ceiling_db.smoothed.next(),
                 mix_pct: self.params.mix_pct.smoothed.next(),
@@ -1660,6 +1993,9 @@ mod tests {
             sc_hpf_hz: 20.0,
             auto_makeup: false,
             makeup_db: 0.0,
+            eq_low_cut_hz: 20.0,
+            eq_mid_cut_db: 0.0,
+            eq_high_shelf_db: 0.0,
             clipper_mode: ClipperMode::Bypass,
             ceiling_db: 0.0,
             mix_pct: 100.0,
@@ -1718,6 +2054,9 @@ mod tests {
             sc_hpf_hz: 20.0,
             auto_makeup: false,
             makeup_db: 0.0,
+            eq_low_cut_hz: 20.0,
+            eq_mid_cut_db: 0.0,
+            eq_high_shelf_db: 0.0,
             clipper_mode: ClipperMode::Bypass,
             ceiling_db: 0.0,
             mix_pct: 100.0,
@@ -1781,6 +2120,9 @@ mod tests {
             sc_hpf_hz: 20.0,
             auto_makeup: false,
             makeup_db: 0.0,
+            eq_low_cut_hz: 20.0,
+            eq_mid_cut_db: 0.0,
+            eq_high_shelf_db: 0.0,
             clipper_mode: ClipperMode::Bypass,
             ceiling_db: 0.0,
             mix_pct: 100.0,
@@ -1843,6 +2185,9 @@ mod tests {
                 sc_hpf_hz: 20.0,
                 auto_makeup: false,
                 makeup_db: 0.0,
+                eq_low_cut_hz: 20.0,
+                eq_mid_cut_db: 0.0,
+                eq_high_shelf_db: 0.0,
                 clipper_mode: mode,
                 ceiling_db,
                 mix_pct: 100.0,
@@ -1898,6 +2243,9 @@ mod tests {
             sc_hpf_hz: 90.0,
             auto_makeup: true,
             makeup_db: 6.0,
+            eq_low_cut_hz: 20.0,
+            eq_mid_cut_db: 0.0,
+            eq_high_shelf_db: 0.0,
             clipper_mode: ClipperMode::HardClip,
             ceiling_db: -4.0,
             mix_pct: 0.0,
@@ -1949,6 +2297,9 @@ mod tests {
             sc_hpf_hz: 90.0,
             auto_makeup: true,
             makeup_db: 24.0,
+            eq_low_cut_hz: 120.0,
+            eq_mid_cut_db: -9.0,
+            eq_high_shelf_db: 12.0,
             clipper_mode: ClipperMode::Bypass,
             ceiling_db: 0.0,
             mix_pct: 100.0,
@@ -1979,7 +2330,338 @@ mod tests {
                 dsp.env_gr_db.is_finite(),
                 "Internal GR envelope became non-finite"
             );
+            for (name, biquad) in [
+                ("eq_low_cut", &dsp.eq_low_cut),
+                ("eq_mid_cut", &dsp.eq_mid_cut),
+                ("eq_high_shelf", &dsp.eq_high_shelf),
+            ] {
+                assert!(
+                    biquad.z1_l.is_finite()
+                        && biquad.z2_l.is_finite()
+                        && biquad.z1_r.is_finite()
+                        && biquad.z2_r.is_finite(),
+                    "Internal EQ biquad states for {} became non-finite",
+                    name
+                );
+            }
         }
+    }
+
+    fn measure_steady_sine_rms(
+        sample_rate: f32,
+        cfg: &DspConfig,
+        freq_hz: f32,
+        amp_l: f32,
+        amp_r: f32,
+    ) -> (f32, f32) {
+        let mut dsp = StereoPunchDsp::new(sample_rate);
+        let total_samples = sample_rate.round() as usize;
+        let warmup_samples = total_samples / 2;
+        let mut sum_sq_l = 0.0_f64;
+        let mut sum_sq_r = 0.0_f64;
+        let mut count = 0_usize;
+
+        for n in 0..total_samples {
+            let phase = 2.0 * std::f32::consts::PI * freq_hz * (n as f32) / sample_rate;
+            let s = phase.sin();
+            let out = dsp.process_sample(amp_l * s, amp_r * s, cfg);
+            assert!(out.out_l.is_finite() && out.out_r.is_finite());
+            if n >= warmup_samples {
+                sum_sq_l += (out.out_l as f64) * (out.out_l as f64);
+                sum_sq_r += (out.out_r as f64) * (out.out_r as f64);
+                count += 1;
+            }
+        }
+
+        let inv_n = 1.0 / (count as f64);
+        ((sum_sq_l * inv_n).sqrt() as f32, (sum_sq_r * inv_n).sqrt() as f32)
+    }
+
+    #[test]
+    fn test_eq_neutral_bypass_transparency() {
+        let mut dsp = StereoPunchDsp::new(48000.0);
+        let neutral_cfg = DspConfig {
+            ratio: 1.0,
+            auto_makeup: false,
+            eq_low_cut_hz: 20.0,
+            eq_mid_cut_db: 0.0,
+            eq_high_shelf_db: 0.0,
+            clipper_mode: ClipperMode::Bypass,
+            ..DspConfig::default()
+        };
+
+        for n in 0..512 {
+            let t = (n as f32) / 48000.0;
+            let in_l = 0.3 * (2.0 * std::f32::consts::PI * 50.0 * t).sin()
+                + 0.25 * (2.0 * std::f32::consts::PI * 500.0 * t).sin();
+            let in_r = -0.2 * (2.0 * std::f32::consts::PI * 12000.0 * t).sin()
+                + 0.35 * (2.0 * std::f32::consts::PI * 500.0 * t).sin();
+            let out = dsp.process_sample(in_l, in_r, &neutral_cfg);
+            assert_eq!(out.out_l.to_bits(), in_l.to_bits());
+            assert_eq!(out.out_r.to_bits(), in_r.to_bits());
+        }
+
+        // Verify engaging EQ then returning to neutral (including 20.5 Hz threshold)
+        // resets biquad states and restores bit-exact transparency.
+        let active_cfg = DspConfig {
+            eq_low_cut_hz: 120.0,
+            eq_mid_cut_db: -9.0,
+            eq_high_shelf_db: 9.0,
+            ..neutral_cfg
+        };
+        for _ in 0..128 {
+            dsp.process_sample(0.4, -0.3, &active_cfg);
+        }
+
+        let boundary_neutral_cfg = DspConfig {
+            eq_low_cut_hz: 20.5,
+            ..neutral_cfg
+        };
+        let out_after_reset = dsp.process_sample(0.42, -0.17, &boundary_neutral_cfg);
+        assert_eq!(out_after_reset.out_l.to_bits(), 0.42_f32.to_bits());
+        assert_eq!(out_after_reset.out_r.to_bits(), (-0.17_f32).to_bits());
+        assert_eq!(dsp.eq_low_cut.z1_l, 0.0);
+        assert_eq!(dsp.eq_mid_cut.z1_r, 0.0);
+        assert_eq!(dsp.eq_high_shelf.z2_l, 0.0);
+    }
+
+    #[test]
+    fn test_eq_low_cut_sub_attenuation() {
+        let base_cfg = DspConfig {
+            ratio: 1.0,
+            auto_makeup: false,
+            clipper_mode: ClipperMode::Bypass,
+            ..DspConfig::default()
+        };
+        let cut_cfg = DspConfig {
+            eq_low_cut_hz: 120.0,
+            ..base_cfg
+        };
+
+        for sample_rate in [44100.0_f32, 48000.0_f32, 96000.0_f32] {
+            let (base_sub_l, base_sub_r) =
+                measure_steady_sine_rms(sample_rate, &base_cfg, 40.0, 0.5, 0.35);
+            let (cut_sub_l, cut_sub_r) =
+                measure_steady_sine_rms(sample_rate, &cut_cfg, 40.0, 0.5, 0.35);
+
+            let sub_att_db_l = 20.0 * (cut_sub_l / base_sub_l).log10();
+            let sub_att_db_r = 20.0 * (cut_sub_r / base_sub_r).log10();
+            assert!(
+                sub_att_db_l < -16.0 && sub_att_db_l > -21.0,
+                "sr={}: expected ~ -19 dB @ 40 Hz with 120 Hz Low Cut, got {:.2} dB",
+                sample_rate,
+                sub_att_db_l
+            );
+            assert!(
+                (sub_att_db_l - sub_att_db_r).abs() < 1.0e-3,
+                "sr={}: stereo Low Cut mismatch L={:.4} dB vs R={:.4} dB",
+                sample_rate,
+                sub_att_db_l,
+                sub_att_db_r
+            );
+
+            let (base_mid_l, _) = measure_steady_sine_rms(sample_rate, &base_cfg, 1000.0, 0.5, 0.5);
+            let (cut_mid_l, _) = measure_steady_sine_rms(sample_rate, &cut_cfg, 1000.0, 0.5, 0.5);
+            let mid_diff_db = 20.0 * (cut_mid_l / base_mid_l).log10();
+            assert!(
+                mid_diff_db.abs() < 0.1,
+                "sr={}: expected 1 kHz preserved by 120 Hz Low Cut, got {:.3} dB",
+                sample_rate,
+                mid_diff_db
+            );
+        }
+
+        // Verify set_sample_rate() invalidates and recalculates EQ filter tuning accurately
+        let mut dsp = StereoPunchDsp::new(44100.0);
+        dsp.process_sample(0.1, 0.1, &cut_cfg);
+        dsp.set_sample_rate(96000.0);
+        let mut sum_sq = 0.0_f64;
+        let total = 96000_usize;
+        for n in 0..total {
+            let phase = 2.0 * std::f32::consts::PI * 40.0 * (n as f32) / 96000.0;
+            let out = dsp.process_sample(0.5 * phase.sin(), 0.5 * phase.sin(), &cut_cfg);
+            if n >= total / 2 {
+                sum_sq += (out.out_l as f64) * (out.out_l as f64);
+            }
+        }
+        let rms_after_sr_change = (sum_sq / ((total / 2) as f64)).sqrt() as f32;
+        let db_after_sr_change = 20.0 * (rms_after_sr_change / (0.5 / std::f32::consts::SQRT_2)).log10();
+        assert!(
+            db_after_sr_change < -16.0 && db_after_sr_change > -21.0,
+            "After set_sample_rate(96000), expected ~ -19 dB @ 40 Hz, got {:.2} dB",
+            db_after_sr_change
+        );
+    }
+
+    #[test]
+    fn test_eq_500hz_cut_attenuation() {
+        let sr = 48000.0_f32;
+        let base_cfg = DspConfig {
+            ratio: 1.0,
+            auto_makeup: false,
+            clipper_mode: ClipperMode::Bypass,
+            ..DspConfig::default()
+        };
+        let cut_12_cfg = DspConfig {
+            eq_mid_cut_db: -12.0,
+            ..base_cfg
+        };
+        let cut_6_cfg = DspConfig {
+            eq_mid_cut_db: -6.0,
+            ..base_cfg
+        };
+
+        let (base_500_l, base_500_r) = measure_steady_sine_rms(sr, &base_cfg, 500.0, 0.5, 0.25);
+        let (cut12_500_l, cut12_500_r) =
+            measure_steady_sine_rms(sr, &cut_12_cfg, 500.0, 0.5, 0.25);
+        let (cut6_500_l, _) = measure_steady_sine_rms(sr, &cut_6_cfg, 500.0, 0.5, 0.25);
+
+        let att12_l = 20.0 * (cut12_500_l / base_500_l).log10();
+        let att12_r = 20.0 * (cut12_500_r / base_500_r).log10();
+        let att6_l = 20.0 * (cut6_500_l / base_500_l).log10();
+
+        assert!(
+            (att12_l - (-12.0)).abs() < 0.35,
+            "Expected -12.0 dB +/- 0.35 dB @ 500 Hz, got {:.3} dB",
+            att12_l
+        );
+        assert!(
+            (att12_l - att12_r).abs() < 1.0e-3,
+            "Stereo 500 Hz Cut mismatch L={:.4} dB vs R={:.4} dB",
+            att12_l,
+            att12_r
+        );
+        assert!(
+            (att6_l - (-6.0)).abs() < 0.35,
+            "Expected -6.0 dB +/- 0.35 dB @ 500 Hz, got {:.3} dB",
+            att6_l
+        );
+
+        // Unrelated frequency bands (60 Hz and 8 kHz) remain nearly intact
+        for freq in [60.0_f32, 8000.0_f32] {
+            let (base_other, _) = measure_steady_sine_rms(sr, &base_cfg, freq, 0.5, 0.5);
+            let (cut_other, _) = measure_steady_sine_rms(sr, &cut_12_cfg, freq, 0.5, 0.5);
+            let diff_db = 20.0 * (cut_other / base_other).log10();
+            assert!(
+                diff_db.abs() < 0.5,
+                "Expected {} Hz untouched by 500 Hz Cut, got {:.3} dB",
+                freq,
+                diff_db
+            );
+        }
+    }
+
+    #[test]
+    fn test_eq_high_shelf_boost_and_cut() {
+        let sr = 48000.0_f32;
+        let base_cfg = DspConfig {
+            ratio: 1.0,
+            auto_makeup: false,
+            clipper_mode: ClipperMode::Bypass,
+            ..DspConfig::default()
+        };
+        let boost_cfg = DspConfig {
+            eq_high_shelf_db: 12.0,
+            ..base_cfg
+        };
+        let cut_cfg = DspConfig {
+            eq_high_shelf_db: -6.0,
+            ..base_cfg
+        };
+
+        let (base_hi_l, base_hi_r) = measure_steady_sine_rms(sr, &base_cfg, 12000.0, 0.2, 0.15);
+        let (boost_hi_l, boost_hi_r) =
+            measure_steady_sine_rms(sr, &boost_cfg, 12000.0, 0.2, 0.15);
+        let (cut_hi_l, cut_hi_r) = measure_steady_sine_rms(sr, &cut_cfg, 12000.0, 0.2, 0.15);
+
+        let boost_db_l = 20.0 * (boost_hi_l / base_hi_l).log10();
+        let boost_db_r = 20.0 * (boost_hi_r / base_hi_r).log10();
+        let cut_db_l = 20.0 * (cut_hi_l / base_hi_l).log10();
+        let cut_db_r = 20.0 * (cut_hi_r / base_hi_r).log10();
+
+        assert!(
+            boost_db_l > 6.5 && boost_db_l < 12.2,
+            "Expected strong +12 dB High Shelf boost @ 12 kHz, got {:.2} dB",
+            boost_db_l
+        );
+        assert!(
+            (boost_db_l - boost_db_r).abs() < 1.0e-3,
+            "Stereo High Shelf boost mismatch"
+        );
+        assert!(
+            cut_db_l < -3.0 && cut_db_l > -6.2,
+            "Expected clear -6 dB High Shelf cut @ 12 kHz, got {:.2} dB",
+            cut_db_l
+        );
+        assert!(
+            (cut_db_l - cut_db_r).abs() < 1.0e-3,
+            "Stereo High Shelf cut mismatch"
+        );
+
+        // Low frequency (100 Hz) must stay unaffected by 10 kHz High Shelf
+        let (base_lo, _) = measure_steady_sine_rms(sr, &base_cfg, 100.0, 0.5, 0.5);
+        let (boost_lo, _) = measure_steady_sine_rms(sr, &boost_cfg, 100.0, 0.5, 0.5);
+        let lo_diff_db = 20.0 * (boost_lo / base_lo).log10();
+        assert!(
+            lo_diff_db.abs() < 0.25,
+            "Expected 100 Hz untouched by 10 kHz High Shelf, got {:.3} dB",
+            lo_diff_db
+        );
+
+        // Post-EQ clipper ceiling enforcement with +12 dB High Shelf boost
+        let ceiling_db = -3.0_f32;
+        let ceiling_lin = db_to_lin(ceiling_db);
+        for mode in [ClipperMode::SoftClip, ClipperMode::HardClip] {
+            let mut dsp = StereoPunchDsp::new(sr);
+            let clipped_cfg = DspConfig {
+                clipper_mode: mode,
+                ceiling_db,
+                ..boost_cfg
+            };
+            let mut any_clipped = false;
+            for n in 0..4096 {
+                let phase = 2.0 * std::f32::consts::PI * 12000.0 * (n as f32) / sr;
+                let s = 0.7 * phase.sin();
+                let out = dsp.process_sample(s, -s, &clipped_cfg);
+                assert!(
+                    out.out_l.abs() <= ceiling_lin + 1.0e-6,
+                    "Mode {:?}: post-EQ Left {} exceeded ceiling {}",
+                    mode,
+                    out.out_l,
+                    ceiling_lin
+                );
+                assert!(
+                    out.out_r.abs() <= ceiling_lin + 1.0e-6,
+                    "Mode {:?}: post-EQ Right {} exceeded ceiling {}",
+                    mode,
+                    out.out_r,
+                    ceiling_lin
+                );
+                if out.clipped {
+                    any_clipped = true;
+                }
+            }
+            assert!(
+                any_clipped,
+                "Mode {:?}: expected +12 dB High Shelf peaks to engage post-EQ clipper",
+                mode
+            );
+        }
+
+        // 0% Parallel Mix remains bit-exact to dry input even with extreme EQ settings
+        let mut dsp_dry = StereoPunchDsp::new(sr);
+        let dry_mix_cfg = DspConfig {
+            eq_low_cut_hz: 160.0,
+            eq_mid_cut_db: -12.0,
+            eq_high_shelf_db: 12.0,
+            clipper_mode: ClipperMode::HardClip,
+            ceiling_db: -6.0,
+            mix_pct: 0.0,
+            ..DspConfig::default()
+        };
+        let dry_out = dsp_dry.process_sample(0.6123, -0.4567, &dry_mix_cfg);
+        assert_eq!(dry_out.out_l.to_bits(), 0.6123_f32.to_bits());
+        assert_eq!(dry_out.out_r.to_bits(), (-0.4567_f32).to_bits());
     }
 
     #[test]
