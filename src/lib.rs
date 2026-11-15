@@ -2535,7 +2535,6 @@ mod tests {
 
     #[test]
     fn test_eq_500hz_cut_attenuation() {
-        let sr = 48000.0_f32;
         let base_cfg = DspConfig {
             ratio: 1.0,
             auto_makeup: false,
@@ -2551,49 +2550,55 @@ mod tests {
             ..base_cfg
         };
 
-        let (base_500_l, base_500_r) = measure_steady_sine_rms(sr, &base_cfg, 500.0, 0.5, 0.25);
-        let (cut12_500_l, cut12_500_r) =
-            measure_steady_sine_rms(sr, &cut_12_cfg, 500.0, 0.5, 0.25);
-        let (cut6_500_l, _) = measure_steady_sine_rms(sr, &cut_6_cfg, 500.0, 0.5, 0.25);
+        for sr in [44100.0_f32, 48000.0_f32, 96000.0_f32] {
+            let (base_500_l, base_500_r) =
+                measure_steady_sine_rms(sr, &base_cfg, 500.0, 0.5, 0.25);
+            let (cut12_500_l, cut12_500_r) =
+                measure_steady_sine_rms(sr, &cut_12_cfg, 500.0, 0.5, 0.25);
+            let (cut6_500_l, _) = measure_steady_sine_rms(sr, &cut_6_cfg, 500.0, 0.5, 0.25);
 
-        let att12_l = 20.0 * (cut12_500_l / base_500_l).log10();
-        let att12_r = 20.0 * (cut12_500_r / base_500_r).log10();
-        let att6_l = 20.0 * (cut6_500_l / base_500_l).log10();
+            let att12_l = 20.0 * (cut12_500_l / base_500_l).log10();
+            let att12_r = 20.0 * (cut12_500_r / base_500_r).log10();
+            let att6_l = 20.0 * (cut6_500_l / base_500_l).log10();
 
-        assert!(
-            (att12_l - (-12.0)).abs() < 0.35,
-            "Expected -12.0 dB +/- 0.35 dB @ 500 Hz, got {:.3} dB",
-            att12_l
-        );
-        assert!(
-            (att12_l - att12_r).abs() < 1.0e-3,
-            "Stereo 500 Hz Cut mismatch L={:.4} dB vs R={:.4} dB",
-            att12_l,
-            att12_r
-        );
-        assert!(
-            (att6_l - (-6.0)).abs() < 0.35,
-            "Expected -6.0 dB +/- 0.35 dB @ 500 Hz, got {:.3} dB",
-            att6_l
-        );
-
-        // Unrelated frequency bands (60 Hz and 8 kHz) remain nearly intact
-        for freq in [60.0_f32, 8000.0_f32] {
-            let (base_other, _) = measure_steady_sine_rms(sr, &base_cfg, freq, 0.5, 0.5);
-            let (cut_other, _) = measure_steady_sine_rms(sr, &cut_12_cfg, freq, 0.5, 0.5);
-            let diff_db = 20.0 * (cut_other / base_other).log10();
             assert!(
-                diff_db.abs() < 0.5,
-                "Expected {} Hz untouched by 500 Hz Cut, got {:.3} dB",
-                freq,
-                diff_db
+                (att12_l - (-12.0)).abs() < 0.35,
+                "sr={}: expected -12.0 dB +/- 0.35 dB @ 500 Hz, got {:.3} dB",
+                sr,
+                att12_l
             );
+            assert!(
+                (att12_l - att12_r).abs() < 1.0e-3,
+                "sr={}: stereo 500 Hz Cut mismatch L={:.4} dB vs R={:.4} dB",
+                sr,
+                att12_l,
+                att12_r
+            );
+            assert!(
+                (att6_l - (-6.0)).abs() < 0.35,
+                "sr={}: expected -6.0 dB +/- 0.35 dB @ 500 Hz, got {:.3} dB",
+                sr,
+                att6_l
+            );
+
+            // Unrelated frequency bands (60 Hz and 8 kHz) remain nearly intact
+            for freq in [60.0_f32, 8000.0_f32] {
+                let (base_other, _) = measure_steady_sine_rms(sr, &base_cfg, freq, 0.5, 0.5);
+                let (cut_other, _) = measure_steady_sine_rms(sr, &cut_12_cfg, freq, 0.5, 0.5);
+                let diff_db = 20.0 * (cut_other / base_other).log10();
+                assert!(
+                    diff_db.abs() < 0.5,
+                    "sr={}: expected {} Hz untouched by 500 Hz Cut, got {:.3} dB",
+                    sr,
+                    freq,
+                    diff_db
+                );
+            }
         }
     }
 
     #[test]
     fn test_eq_high_shelf_boost_and_cut() {
-        let sr = 48000.0_f32;
         let base_cfg = DspConfig {
             ratio: 1.0,
             auto_makeup: false,
@@ -2609,46 +2614,56 @@ mod tests {
             ..base_cfg
         };
 
-        let (base_hi_l, base_hi_r) = measure_steady_sine_rms(sr, &base_cfg, 12000.0, 0.2, 0.15);
-        let (boost_hi_l, boost_hi_r) =
-            measure_steady_sine_rms(sr, &boost_cfg, 12000.0, 0.2, 0.15);
-        let (cut_hi_l, cut_hi_r) = measure_steady_sine_rms(sr, &cut_cfg, 12000.0, 0.2, 0.15);
+        for sr in [44100.0_f32, 48000.0_f32, 96000.0_f32] {
+            let (base_hi_l, base_hi_r) =
+                measure_steady_sine_rms(sr, &base_cfg, 12000.0, 0.2, 0.15);
+            let (boost_hi_l, boost_hi_r) =
+                measure_steady_sine_rms(sr, &boost_cfg, 12000.0, 0.2, 0.15);
+            let (cut_hi_l, cut_hi_r) =
+                measure_steady_sine_rms(sr, &cut_cfg, 12000.0, 0.2, 0.15);
 
-        let boost_db_l = 20.0 * (boost_hi_l / base_hi_l).log10();
-        let boost_db_r = 20.0 * (boost_hi_r / base_hi_r).log10();
-        let cut_db_l = 20.0 * (cut_hi_l / base_hi_l).log10();
-        let cut_db_r = 20.0 * (cut_hi_r / base_hi_r).log10();
+            let boost_db_l = 20.0 * (boost_hi_l / base_hi_l).log10();
+            let boost_db_r = 20.0 * (boost_hi_r / base_hi_r).log10();
+            let cut_db_l = 20.0 * (cut_hi_l / base_hi_l).log10();
+            let cut_db_r = 20.0 * (cut_hi_r / base_hi_r).log10();
 
-        assert!(
-            boost_db_l > 6.5 && boost_db_l < 12.2,
-            "Expected strong +12 dB High Shelf boost @ 12 kHz, got {:.2} dB",
-            boost_db_l
-        );
-        assert!(
-            (boost_db_l - boost_db_r).abs() < 1.0e-3,
-            "Stereo High Shelf boost mismatch"
-        );
-        assert!(
-            cut_db_l < -3.0 && cut_db_l > -6.2,
-            "Expected clear -6 dB High Shelf cut @ 12 kHz, got {:.2} dB",
-            cut_db_l
-        );
-        assert!(
-            (cut_db_l - cut_db_r).abs() < 1.0e-3,
-            "Stereo High Shelf cut mismatch"
-        );
+            assert!(
+                boost_db_l > 6.5 && boost_db_l < 12.2,
+                "sr={}: expected strong +12 dB High Shelf boost @ 12 kHz, got {:.2} dB",
+                sr,
+                boost_db_l
+            );
+            assert!(
+                (boost_db_l - boost_db_r).abs() < 1.0e-3,
+                "sr={}: stereo High Shelf boost mismatch",
+                sr
+            );
+            assert!(
+                cut_db_l < -3.0 && cut_db_l > -6.2,
+                "sr={}: expected clear -6 dB High Shelf cut @ 12 kHz, got {:.2} dB",
+                sr,
+                cut_db_l
+            );
+            assert!(
+                (cut_db_l - cut_db_r).abs() < 1.0e-3,
+                "sr={}: stereo High Shelf cut mismatch",
+                sr
+            );
 
-        // Low frequency (100 Hz) must stay unaffected by 10 kHz High Shelf
-        let (base_lo, _) = measure_steady_sine_rms(sr, &base_cfg, 100.0, 0.5, 0.5);
-        let (boost_lo, _) = measure_steady_sine_rms(sr, &boost_cfg, 100.0, 0.5, 0.5);
-        let lo_diff_db = 20.0 * (boost_lo / base_lo).log10();
-        assert!(
-            lo_diff_db.abs() < 0.25,
-            "Expected 100 Hz untouched by 10 kHz High Shelf, got {:.3} dB",
-            lo_diff_db
-        );
+            // Low frequency (100 Hz) must stay unaffected by 10 kHz High Shelf
+            let (base_lo, _) = measure_steady_sine_rms(sr, &base_cfg, 100.0, 0.5, 0.5);
+            let (boost_lo, _) = measure_steady_sine_rms(sr, &boost_cfg, 100.0, 0.5, 0.5);
+            let lo_diff_db = 20.0 * (boost_lo / base_lo).log10();
+            assert!(
+                lo_diff_db.abs() < 0.25,
+                "sr={}: expected 100 Hz untouched by 10 kHz High Shelf, got {:.3} dB",
+                sr,
+                lo_diff_db
+            );
+        }
 
         // Post-EQ clipper ceiling enforcement with +12 dB High Shelf boost
+        let sr = 48000.0_f32;
         let ceiling_db = -3.0_f32;
         let ceiling_lin = db_to_lin(ceiling_db);
         for mode in [ClipperMode::SoftClip, ClipperMode::HardClip] {
