@@ -4,6 +4,10 @@ Toutes les modifications notables de ce projet sont documentées dans ce fichier
 
 ## [Unreleased]
 ### Ajouté
+- **Fonction Gain Match Automatique (`006-gain-match`) :**
+  - Ajout du paramètre DAW rétrocompatible `gain_match` (`OFF` par défaut) et d'un étage de compensation stéréo lié en toute fin de chaîne (post-Compression, post-Drum Bus EQ, post-Output Clipper et post-Mix parallèle, juste avant le safety clamp).
+  - Mesure feed-forward par double enveloppe RMS appariée (`400 ms`) entre l'entrée brute (avant `Input Trim`) et le signal post-traitement, avec lissage doux (`150 ms` actif, `35 ms` au retour sur `OFF`), bornage `[-24.0, +24.0]` dB et détecteur de présence (`50 ms` à `-60 dBFS`) figeant (`Hold`) la compensation sur les silences pour préserver les transitoires et éviter l'amplification du bruit de fond.
+  - Ajout du bouton `[Gain Match: OFF]` / `[Gain Match: ON]` et de l'affichage en temps réel `Trim: +0.0 dB` dans la section `4. GAIN REDUCTION & STEREO BUS METERING` (avec ajustement de `UI_METER_HEIGHT` à `384.0` px) ainsi que des tests unitaires DSP et `egui` dédiés.
 - **Métadonnées statiques des bundles VST3 & CLAP (`005-plugin-bundle-metadata`) :**
   - Génération automatique de `Contents/Resources/moduleinfo.json` dans le bundle VST3 lors du bundling `xtask` (exposant `Name = Omore Punch`, `Version` issue de `Cargo.toml`, `Vendor = Omore`, `CID`, et `Sub Categories = ["Fx", "Dynamics", "Distortion", "Stereo"]` pour les gestionnaires de plugins comme Plugoff).
   - Embarquement des ressources PE `VS_VERSION_INFO` dans les binaires Windows (`.vst3` et `.clap`) via `build.rs` et `winresource`, compatible avec les versions de développement suffixées `-dev`.
