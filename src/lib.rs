@@ -1058,7 +1058,7 @@ impl OmorePunch {
 
 impl Plugin for OmorePunch {
     const NAME: &'static str = "Omore Punch";
-    const VENDOR: &'static str = "Omore Audio";
+    const VENDOR: &'static str = "Omore";
     const URL: &'static str = "https://omore-audio.local";
     const EMAIL: &'static str = "contact@omore-audio.local";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -3631,6 +3631,24 @@ mod tests {
             max_gr_jump_db <= 1.0,
             "Sample-to-sample GR jump {} dB exceeded 1.0 dB threshold during mode switches",
             max_gr_jump_db
+        );
+    }
+
+    #[test]
+    fn test_plugin_metadata_and_daw_compat_ids() {
+        assert_eq!(OmorePunch::NAME, "Omore Punch");
+        assert_eq!(OmorePunch::VENDOR, "Omore");
+        assert_eq!(OmorePunch::VERSION, env!("CARGO_PKG_VERSION"));
+        assert_eq!(OmorePunch::VST3_CLASS_ID, *b"OmorePunchBusV01");
+        assert_eq!(OmorePunch::CLAP_ID, "local.omore-audio.omore-punch");
+        assert_eq!(
+            OmorePunch::VST3_SUBCATEGORIES,
+            &[
+                Vst3SubCategory::Fx,
+                Vst3SubCategory::Dynamics,
+                Vst3SubCategory::Distortion,
+                Vst3SubCategory::Stereo,
+            ]
         );
     }
 }

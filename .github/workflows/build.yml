@@ -95,8 +95,8 @@ jobs:
         with:
           name: Omore-Punch-${{ matrix.artifact_suffix }}
           path: |
-            target/bundled/omore-punch.vst3
-            target/bundled/omore-punch.clap
+            target/bundled/Omore Punch.vst3
+            target/bundled/Omore Punch.clap
 
   release:
     # Publie une GitHub Release quand un tag de version `vX.Y.Z` est pousse : reprend les bundles
