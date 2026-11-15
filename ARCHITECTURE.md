@@ -12,8 +12,8 @@ Le fichier est structuré en quatre blocs isolés :
 ## 2. Garanties Temps Réel (`process`)
 - **Zéro allocation mémoire :** La fonctionnalité `assert_process_allocs` de `nih-plug` est activée pour garantir qu'aucune allocation sur le tas (`Vec`, `String`, `Box`, `format!`) n'a lieu dans le thread audio.
 - **Zéro verrou bloquant :** Aucune primitive `Mutex` ou `RwLock` n'est utilisée entre le thread audio et l'UI.
-- **Précalcul des coefficients :** Les coefficients balistiques (`attack_coeff`, `release_coeff`) et le coefficient du filtre passe-haut de Sidechain (`sc_hpf_coeff`) ne sont recalculés que si `sample_rate`, `attack_ms`, `release_ms` ou `sc_hpf_hz` a varié.
-- **Protection Anti Auto-Mute Reaper :** `sanitize_sample()` filtre systématiquement les `NaN` et `Inf` à l'entrée et à la sortie (ainsi que dans l'état du filtre Sidechain) et applique un clamp matériel strict dans `[-4.0, 4.0]` (~`+12 dBFS`).
+- **Précalcul des coefficients :** Les coefficients balistiques (`attack_coeff`, `release_coeff`), le coefficient du filtre passe-haut de Sidechain (`sc_hpf_coeff`) et les coefficients biquads de l'EQ 3 bandes (`eq_low_cut`, `eq_mid_cut`, `eq_high_shelf`) ne sont recalculés que si `sample_rate` ou un des paramètres associés a varié.
+- **Protection Anti Auto-Mute Reaper :** `sanitize_sample()` filtre systématiquement les `NaN` et `Inf` à l'entrée et à la sortie (ainsi que `sanitize_biquad_state()` et les états du filtre Sidechain contre les dénormaux) et applique un clamp matériel strict dans `[-4.0, 4.0]` (~`+12 dBFS`).
 
 ## 3. Chaîne de Traitement Audio (Ordre des Opérations)
 ```text
@@ -39,6 +39,9 @@ Entrée Stéréo (L/R)
             |     [5. Auto-Makeup (35%) + Makeup Manuel]           |
             |              |                                       |
             +<-------------+ (Gain appliqué au signal plein spectre)
+            |                                                      |
+            v                                                      |
+   [5b. Drum Bus EQ (Low Cut / 500Hz Cut / High Shelf)]            |
             |                                                      |
             v                                                      |
    [6. Clipper Final (Soft Clip / Hard Clip / Bypass @ Ceiling)]   |

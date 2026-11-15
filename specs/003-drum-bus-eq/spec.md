@@ -21,7 +21,7 @@ As a mix engineer using Omore Punch on a stereo drum bus, I want a dedicated 3-f
 **Acceptance Scenarios**:
 
 1. **Given** all three EQ controls are at their neutral/default positions, **When** audio passes through the plugin, **Then** the EQ introduces no audible coloration or level change (transparent bypass behavior).
-2. **Given** the Low Cut control is raised above its off/minimum setting, **When** low-frequency drum energy (e.g., sub-bass rumble below the cutoff) passes through, **Then** frequencies below the cutoff are attenuated smoothly on both left and right channels.
+2. **Given** the Low Cut control is raised above its 20.0 Hz minimum/bypass setting, **When** low-frequency drum energy (e.g., sub-bass rumble below the cutoff) passes through, **Then** frequencies below the cutoff are attenuated smoothly on both left and right channels.
 3. **Given** the 500 Hz Cut control is turned down below 0 dB, **When** midrange energy around 500 Hz passes through, **Then** the 500 Hz region is attenuated proportionally to the selected dB reduction while leaving unrelated frequency bands intact.
 4. **Given** the High Shelf control is adjusted away from 0 dB, **When** high-frequency transients (cymbals, snare wires, stick attack) pass through, **Then** frequencies above the shelf corner are boosted (or cut, if bipolar) according to the control value.
 
@@ -55,10 +55,10 @@ As a user already familiar with Omore Punch's console-style interface, I want th
 - **FR-001**: System MUST provide a dedicated EQ section limited strictly to three tonal functions: a Low Cut (high-pass) filter, a 500 Hz cut, and a High Shelf.
 - **FR-002**: System MUST position the EQ in the stereo audio signal chain post-compressor and immediately pre-clipper (`Compressor -> Drum Bus EQ -> Output Clipper -> Parallel Mix`), so it shapes the compressed drum bus without affecting the compressor detector, lets the clipper catch any peaks added by the High Shelf, and preserves the bit-exact dry path at `0%` parallel mix.
 - **FR-003**: System MUST provide exactly three rotary knob controls in the EQ section:
-  - **Low Cut**: High-pass filter cutoff frequency from Off (minimum, <= 20 Hz bypass) up to 160 Hz (default: Off).
+  - **Low Cut**: High-pass filter cutoff frequency from 20.0 Hz (minimum, bypassed at <= 20.5 Hz) up to 160.0 Hz (default: 20.0 Hz, bypassed).
   - **500 Hz Cut**: Cut-only peaking attenuation centered at 500 Hz from 0.0 dB down to -12.0 dB (default: 0.0 dB).
   - **High Shelf**: High-shelf gain centered at a fixed musical 10 kHz corner frequency from -6.0 dB to +12.0 dB (default: 0.0 dB).
-- **FR-004**: Each EQ control MUST default to a transparent neutral state (Low Cut off/minimum, 500 Hz Cut at 0.0 dB, High Shelf at 0.0 dB) so existing mix balance is unchanged until adjusted.
+- **FR-004**: Each EQ control MUST default to a transparent neutral state (Low Cut at 20.0 Hz bypassed, 500 Hz Cut at 0.0 dB, High Shelf at 0.0 dB) so existing mix balance is unchanged until adjusted.
 - **FR-005**: System MUST process both stereo channels identically using matched stereo filter instances so the stereo image and phase relationship of the drum bus remain centered.
 - **FR-006**: System MUST expose all EQ parameters to the host DAW for automation and state persistence (save/recall).
 - **FR-007**: The user interface MUST present the EQ as a numbered section (`3. DRUM BUS EQ`) in the left control column using the same rotary knob style (graduated ring, color-coded cap, angular pointer, vertical drag, fine-drag modifier, double-click reset, formatted readout, and compact `-`/`+`/`Reset` buttons) and renumber the right-column metering section to `4. GAIN REDUCTION & STEREO BUS METERING`.
