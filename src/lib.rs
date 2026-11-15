@@ -17,6 +17,7 @@ const SAFETY_CLAMP_LIMIT: f32 = 4.0;
 const MIN_DETECTOR_PEAK: f32 = 1.0e-6;
 const MIN_FLOOR_DB: f32 = -60.0;
 const MAX_GR_METER_DB: f32 = 24.0;
+const AUTO_SLOW_CHARGE_MS: f32 = 180.0;
 
 // ----------------------------------------------------------------------------
 // Helper Functions for Lock-Free Atomic f32 Storage
@@ -68,6 +69,42 @@ pub enum ClipperMode {
     #[id = "bypass_clip"]
     #[name = "Bypass Clipper"]
     Bypass,
+}
+
+// ----------------------------------------------------------------------------
+// Release Mode Enumeration
+// ----------------------------------------------------------------------------
+
+#[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
+pub enum ReleaseMode {
+    #[id = "manual"]
+    #[name = "Manual"]
+    Manual,
+
+    #[id = "auto_tight"]
+    #[name = "Auto Tight (50/600 ms)"]
+    AutoTight,
+
+    #[id = "auto_punch"]
+    #[name = "Auto Punch (80/800 ms)"]
+    AutoPunch,
+
+    #[id = "auto_glue"]
+    #[name = "Auto Glue (100/1200 ms)"]
+    AutoGlue,
+}
+
+impl ReleaseMode {
+    /// Returns `(fast_ms, slow_ms)` for dual-stage auto-release profiles, or `None` for manual.
+    #[inline(always)]
+    pub fn auto_time_constants_ms(self) -> Option<(f32, f32)> {
+        match self {
+            Self::Manual => None,
+            Self::AutoTight => Some((50.0, 600.0)),
+            Self::AutoPunch => Some((80.0, 800.0)),
+            Self::AutoGlue => Some((100.0, 1200.0)),
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -157,6 +194,7 @@ pub struct DspConfig {
     pub ratio: f32,
     pub attack_ms: f32,
     pub release_ms: f32,
+    pub release_mode: ReleaseMode,
     pub sc_hpf_hz: f32,
     pub auto_makeup: bool,
     pub makeup_db: f32,
@@ -176,6 +214,7 @@ impl Default for DspConfig {
             ratio: 4.0,
             attack_ms: 3.0,
             release_ms: 80.0,
+            release_mode: ReleaseMode::Manual,
             sc_hpf_hz: 20.0,
             auto_makeup: true,
             makeup_db: 0.0,
@@ -202,8 +241,13 @@ pub struct StereoPunchDsp {
     sample_rate: f32,
     cached_attack_ms: f32,
     cached_release_ms: f32,
+    cached_release_mode: ReleaseMode,
+    auto_coeffs_initialized: bool,
     attack_coeff: f32,
     release_coeff: f32,
+    auto_fast_release_coeff: f32,
+    auto_slow_release_coeff: f32,
+    auto_slow_charge_coeff: f32,
     cached_sc_hpf_hz: f32,
     sc_hpf_coeff: f32,
     sc_prev_in_l: f32,
@@ -216,6 +260,7 @@ pub struct StereoPunchDsp {
     cached_eq_low_cut_hz: f32,
     cached_eq_mid_cut_db: f32,
     cached_eq_high_shelf_db: f32,
+    auto_slow_gr_db: f32,
     pub env_gr_db: f32,
 }
 
@@ -225,8 +270,13 @@ impl Default for StereoPunchDsp {
             sample_rate: 48000.0,
             cached_attack_ms: -1.0,
             cached_release_ms: -1.0,
+            cached_release_mode: ReleaseMode::Manual,
+            auto_coeffs_initialized: false,
             attack_coeff: 0.0,
             release_coeff: 0.0,
+            auto_fast_release_coeff: 0.0,
+            auto_slow_release_coeff: 0.0,
+            auto_slow_charge_coeff: 0.0,
             cached_sc_hpf_hz: -1.0,
             sc_hpf_coeff: 0.0,
             sc_prev_in_l: 0.0,
@@ -239,9 +289,10 @@ impl Default for StereoPunchDsp {
             cached_eq_low_cut_hz: -1.0,
             cached_eq_mid_cut_db: -999.0,
             cached_eq_high_shelf_db: -999.0,
+            auto_slow_gr_db: 0.0,
             env_gr_db: 0.0,
         };
-        dsp.update_ballistics(48000.0, 3.0, 80.0);
+        dsp.update_ballistics(48000.0, 3.0, 80.0, ReleaseMode::Manual);
         dsp.update_sidechain_hpf(48000.0, 20.0);
         dsp.update_eq(48000.0, 20.0, 0.0, 0.0);
         dsp
@@ -256,8 +307,15 @@ impl StereoPunchDsp {
     }
 
     #[inline(always)]
+    fn exp_coeff_from_ms(time_ms: f32, sample_rate: f32, min_sec: f32) -> f32 {
+        let time_sec = (time_ms * 0.001).max(min_sec);
+        (-1.0 / (time_sec * sample_rate)).exp()
+    }
+
+    #[inline(always)]
     pub fn reset(&mut self) {
         self.env_gr_db = 0.0;
+        self.auto_slow_gr_db = 0.0;
         self.sc_prev_in_l = 0.0;
         self.sc_prev_in_r = 0.0;
         self.sc_prev_out_l = 0.0;
@@ -274,6 +332,7 @@ impl StereoPunchDsp {
             self.sample_rate = sr;
             let att = self.cached_attack_ms.max(0.1);
             let rel = self.cached_release_ms.max(10.0);
+            let rel_mode = self.cached_release_mode;
             let hpf = self.cached_sc_hpf_hz.clamp(20.0, 250.0);
             let eq_lc = self.cached_eq_low_cut_hz.clamp(20.0, 160.0);
             let eq_mc = if self.cached_eq_mid_cut_db < -100.0 {
@@ -288,22 +347,31 @@ impl StereoPunchDsp {
             };
             self.cached_attack_ms = -1.0;
             self.cached_release_ms = -1.0;
+            self.auto_coeffs_initialized = false;
             self.cached_sc_hpf_hz = -1.0;
             self.cached_eq_low_cut_hz = -1.0;
             self.cached_eq_mid_cut_db = -999.0;
             self.cached_eq_high_shelf_db = -999.0;
-            self.update_ballistics(sr, att, rel);
+            self.update_ballistics(sr, att, rel, rel_mode);
             self.update_sidechain_hpf(sr, hpf);
             self.update_eq(sr, eq_lc, eq_mc, eq_hs);
         }
     }
 
     #[inline(always)]
-    pub fn update_ballistics(&mut self, sample_rate: f32, attack_ms: f32, release_ms: f32) {
+    pub fn update_ballistics(
+        &mut self,
+        sample_rate: f32,
+        attack_ms: f32,
+        release_ms: f32,
+        release_mode: ReleaseMode,
+    ) {
         let sr = sample_rate.max(8000.0);
         let sr_changed = (sr - self.sample_rate).abs() > 1e-3;
         let att_changed = (attack_ms - self.cached_attack_ms).abs() > 1e-5;
         let rel_changed = (release_ms - self.cached_release_ms).abs() > 1e-5;
+        let mode_changed =
+            !self.auto_coeffs_initialized || release_mode != self.cached_release_mode;
 
         if sr_changed {
             self.cached_sc_hpf_hz = -1.0;
@@ -315,15 +383,26 @@ impl StereoPunchDsp {
         if sr_changed || att_changed {
             self.sample_rate = sr;
             self.cached_attack_ms = attack_ms;
-            let attack_sec = (attack_ms * 0.001).max(0.0001);
-            self.attack_coeff = (-1.0 / (attack_sec * sr)).exp();
+            self.attack_coeff = Self::exp_coeff_from_ms(attack_ms, sr, 0.0001);
         }
 
         if sr_changed || rel_changed {
             self.sample_rate = sr;
             self.cached_release_ms = release_ms;
-            let release_sec = (release_ms * 0.001).max(0.001);
-            self.release_coeff = (-1.0 / (release_sec * sr)).exp();
+            self.release_coeff = Self::exp_coeff_from_ms(release_ms, sr, 0.001);
+        }
+
+        if sr_changed || mode_changed {
+            self.sample_rate = sr;
+            self.cached_release_mode = release_mode;
+            if sr_changed || !self.auto_coeffs_initialized {
+                self.auto_slow_charge_coeff =
+                    Self::exp_coeff_from_ms(AUTO_SLOW_CHARGE_MS, sr, 0.001);
+            }
+            let (fast_ms, slow_ms) = release_mode.auto_time_constants_ms().unwrap_or((80.0, 800.0));
+            self.auto_fast_release_coeff = Self::exp_coeff_from_ms(fast_ms, sr, 0.001);
+            self.auto_slow_release_coeff = Self::exp_coeff_from_ms(slow_ms, sr, 0.001);
+            self.auto_coeffs_initialized = true;
         }
     }
 
@@ -337,6 +416,7 @@ impl StereoPunchDsp {
         if sr_changed {
             self.cached_attack_ms = -1.0;
             self.cached_release_ms = -1.0;
+            self.auto_coeffs_initialized = false;
             self.cached_eq_low_cut_hz = -1.0;
             self.cached_eq_mid_cut_db = -999.0;
             self.cached_eq_high_shelf_db = -999.0;
@@ -462,6 +542,7 @@ impl StereoPunchDsp {
             self.sample_rate = sr;
             self.cached_attack_ms = -1.0;
             self.cached_release_ms = -1.0;
+            self.auto_coeffs_initialized = false;
             self.cached_sc_hpf_hz = -1.0;
             self.cached_eq_low_cut_hz = -1.0;
             self.cached_eq_mid_cut_db = -999.0;
@@ -531,7 +612,12 @@ impl StereoPunchDsp {
         let dry_r = sanitize_sample(raw_r);
 
         // Update envelope, sidechain filter and EQ coefficients only if parameters changed
-        self.update_ballistics(self.sample_rate, cfg.attack_ms, cfg.release_ms);
+        self.update_ballistics(
+            self.sample_rate,
+            cfg.attack_ms,
+            cfg.release_ms,
+            cfg.release_mode,
+        );
         self.update_sidechain_hpf(self.sample_rate, cfg.sc_hpf_hz);
         self.update_eq(
             self.sample_rate,
@@ -586,18 +672,34 @@ impl StereoPunchDsp {
             0.0
         };
 
-        // 4. Omore Punch Ballistics (3ms / 80ms default)
+        // 4. Omore Punch Ballistics (Manual or Dual-Stage Auto-Release)
+        let slow_coeff = if target_gr_db > self.auto_slow_gr_db {
+            self.auto_slow_charge_coeff
+        } else {
+            self.auto_slow_release_coeff
+        };
+        self.auto_slow_gr_db =
+            slow_coeff * self.auto_slow_gr_db + (1.0 - slow_coeff) * target_gr_db;
+        if !self.auto_slow_gr_db.is_finite() || self.auto_slow_gr_db < 1.0e-20 {
+            self.auto_slow_gr_db = 0.0;
+        }
+
         if target_gr_db > self.env_gr_db {
             self.env_gr_db =
                 self.attack_coeff * self.env_gr_db + (1.0 - self.attack_coeff) * target_gr_db;
-        } else {
+        } else if cfg.release_mode == ReleaseMode::Manual {
             self.env_gr_db =
                 self.release_coeff * self.env_gr_db + (1.0 - self.release_coeff) * target_gr_db;
+        } else {
+            let fast_next = self.auto_fast_release_coeff * self.env_gr_db
+                + (1.0 - self.auto_fast_release_coeff) * target_gr_db;
+            self.env_gr_db = fast_next.max(self.auto_slow_gr_db);
         }
 
-        if !self.env_gr_db.is_finite() || self.env_gr_db < 0.0 {
+        if !self.env_gr_db.is_finite() || self.env_gr_db < 1.0e-20 {
             self.env_gr_db = 0.0;
         }
+        self.auto_slow_gr_db = self.auto_slow_gr_db.min(self.env_gr_db);
 
         // 5. Gain Compensation (Omore Auto-Makeup + Manual Makeup)
         let auto_makeup_db = if cfg.auto_makeup && cfg.ratio > 1.01 {
@@ -709,6 +811,9 @@ pub struct OmorePunchParams {
     #[id = "release_ms"]
     pub release_ms: FloatParam,
 
+    #[id = "release_mode"]
+    pub release_mode: EnumParam<ReleaseMode>,
+
     #[id = "sc_hpf_hz"]
     pub sc_hpf_hz: FloatParam,
 
@@ -740,6 +845,22 @@ pub struct OmorePunchParams {
     /// or monitor Gain Reduction (dB) as a track control / automation lane.
     #[id = "gr_meter_db"]
     pub gr_meter_db: FloatParam,
+}
+
+/// Builds the `Release` parameter with a configurable default so tests can exercise wide readouts.
+fn make_release_ms_param(default_ms: f32) -> FloatParam {
+    FloatParam::new(
+        "Release",
+        default_ms,
+        FloatRange::Skewed {
+            min: 10.0,
+            max: 500.0,
+            factor: FloatRange::skew_factor(-1.2),
+        },
+    )
+    .with_smoother(SmoothingStyle::Linear(5.0))
+    .with_unit(" ms")
+    .with_value_to_string(formatters::v2s_f32_rounded(1))
 }
 
 impl Default for OmorePunchParams {
@@ -795,18 +916,9 @@ impl Default for OmorePunchParams {
             .with_unit(" ms")
             .with_value_to_string(formatters::v2s_f32_rounded(2)),
 
-            release_ms: FloatParam::new(
-                "Release",
-                80.0,
-                FloatRange::Skewed {
-                    min: 10.0,
-                    max: 500.0,
-                    factor: FloatRange::skew_factor(-1.2),
-                },
-            )
-            .with_smoother(SmoothingStyle::Linear(5.0))
-            .with_unit(" ms")
-            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+            release_ms: make_release_ms_param(80.0),
+
+            release_mode: EnumParam::new("Release Mode", ReleaseMode::Manual),
 
             sc_hpf_hz: FloatParam::new(
                 "SC HPF",
@@ -1014,6 +1126,7 @@ impl Plugin for OmorePunch {
         let mut block_clipped = false;
 
         let auto_makeup = self.params.auto_makeup.value();
+        let release_mode = self.params.release_mode.value();
         let clipper_mode = self.params.clipper_mode.value();
 
         for mut channel_samples in buffer.iter_samples() {
@@ -1027,6 +1140,7 @@ impl Plugin for OmorePunch {
                 ratio: self.params.ratio.smoothed.next(),
                 attack_ms: self.params.attack_ms.smoothed.next(),
                 release_ms: self.params.release_ms.smoothed.next(),
+                release_mode,
                 sc_hpf_hz: self.params.sc_hpf_hz.smoothed.next(),
                 auto_makeup,
                 makeup_db: self.params.makeup_db.smoothed.next(),
@@ -1090,7 +1204,7 @@ impl Plugin for OmorePunch {
 // ----------------------------------------------------------------------------
 
 const UI_WINDOW_WIDTH: u32 = 820;
-const UI_WINDOW_HEIGHT: u32 = 620;
+const UI_WINDOW_HEIGHT: u32 = 650;
 const UI_LEFT_COL_WIDTH: f32 = 480.0;
 const UI_RIGHT_COL_WIDTH: f32 = 310.0;
 const UI_COL_GAP: f32 = 10.0;
@@ -1103,7 +1217,7 @@ const UI_KNOB_GRID_SPACING_Y: f32 = 4.0;
 const UI_KNOB_STEP_BTN_WIDTH: f32 = 22.0;
 const UI_KNOB_RESET_BTN_WIDTH: f32 = 46.0;
 const UI_KNOB_BTN_HEIGHT: f32 = 16.0;
-const UI_METER_HEIGHT: f32 = 390.0;
+const UI_METER_HEIGHT: f32 = 416.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SslKnobColor {
@@ -1159,6 +1273,31 @@ fn draw_ssl_knob_cell(
     max_val: f32,
     color_family: SslKnobColor,
 ) {
+    draw_ssl_knob_cell_ex(
+        ui,
+        setter,
+        param,
+        label,
+        step,
+        min_val,
+        max_val,
+        color_family,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_ssl_knob_cell_ex(
+    ui: &mut egui::Ui,
+    setter: &ParamSetter,
+    param: &FloatParam,
+    label: &str,
+    step: f32,
+    min_val: f32,
+    max_val: f32,
+    color_family: SslKnobColor,
+    auto_override: bool,
+) {
     let current_val = param.value();
     let default_val = param.default_plain_value();
     let formatted_val = param.to_string();
@@ -1170,21 +1309,29 @@ fn draw_ssl_knob_cell(
             ui.set_width(UI_KNOB_CELL_WIDTH);
             ui.spacing_mut().item_spacing.y = 2.0;
 
+            let label_color = if auto_override {
+                egui::Color32::from_rgb(135, 142, 154)
+            } else {
+                egui::Color32::from_rgb(220, 224, 232)
+            };
             ui.label(
                 egui::RichText::new(label)
                     .monospace()
                     .strong()
                     .size(11.0)
-                    .color(egui::Color32::from_rgb(220, 224, 232)),
+                    .color(label_color),
             );
 
             let (knob_rect, resp) = ui.allocate_exact_size(
                 egui::vec2(UI_KNOB_DIAMETER, UI_KNOB_DIAMETER),
                 egui::Sense::click_and_drag(),
             );
-            let resp = resp.on_hover_text(
-                "Drag vertically to adjust (hold Shift for fine control, double-click to reset)",
-            );
+            let hover_msg = if auto_override {
+                "Overridden by Auto-Release (drag or step to pre-stage Manual Release, double-click to reset)"
+            } else {
+                "Drag vertically to adjust (hold Shift for fine control, double-click to reset)"
+            };
+            let resp = resp.on_hover_text(hover_msg);
 
             if resp.drag_started() {
                 setter.begin_set_parameter(param);
@@ -1222,7 +1369,11 @@ fn draw_ssl_knob_cell(
                 let p_in = center + dir * (outer_r - 4.0);
                 let p_out = center + dir * (outer_r - 0.5);
                 let tick_color = if tick_norm <= norm + 0.001 {
-                    egui::Color32::from_rgb(245, 185, 45)
+                    if auto_override {
+                        egui::Color32::from_rgb(108, 114, 126)
+                    } else {
+                        egui::Color32::from_rgb(245, 185, 45)
+                    }
                 } else {
                     egui::Color32::from_rgb(85, 92, 108)
                 };
@@ -1238,10 +1389,20 @@ fn draw_ssl_knob_cell(
                 egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(62, 68, 82)),
             );
 
-            // Inner SSL colored cap
+            // Inner SSL colored cap (dimmed when overridden by Auto-Release)
             let cap_r = outer_r - 8.5;
             let active_or_hovered = resp.hovered() || resp.dragged();
-            painter.circle_filled(center, cap_r, color_family.cap_color(active_or_hovered));
+            let base_cap = color_family.cap_color(active_or_hovered);
+            let cap_color = if auto_override {
+                egui::Color32::from_rgb(
+                    base_cap.r() / 3 + 38,
+                    base_cap.g() / 3 + 38,
+                    base_cap.b() / 3 + 40,
+                )
+            } else {
+                base_cap
+            };
+            painter.circle_filled(center, cap_r, cap_color);
             painter.circle_stroke(
                 center,
                 cap_r,
@@ -1251,18 +1412,33 @@ fn draw_ssl_knob_cell(
             // Angular pointer line
             let val_angle = (-135.0_f32 + norm * 270.0_f32).to_radians();
             let val_dir = egui::vec2(val_angle.sin(), -val_angle.cos());
+            let pointer_color = if auto_override {
+                egui::Color32::from_rgb(155, 160, 170)
+            } else {
+                egui::Color32::from_rgb(250, 250, 245)
+            };
             painter.line_segment(
                 [center + val_dir * 2.5, center + val_dir * (skirt_r - 1.5)],
-                egui::Stroke::new(2.2_f32, egui::Color32::from_rgb(250, 250, 245)),
+                egui::Stroke::new(2.2_f32, pointer_color),
             );
             painter.circle_filled(center, 2.0, egui::Color32::from_rgb(25, 28, 34));
 
-            ui.label(
-                egui::RichText::new(formatted_val)
-                    .monospace()
-                    .size(11.0)
-                    .color(egui::Color32::from_rgb(245, 185, 45)),
-            );
+            if auto_override {
+                let auto_readout = format!("AUTO ({})", formatted_val);
+                ui.label(
+                    egui::RichText::new(auto_readout)
+                        .monospace()
+                        .size(10.0)
+                        .color(egui::Color32::from_rgb(150, 156, 168)),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(formatted_val)
+                        .monospace()
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(245, 185, 45)),
+                );
+            }
 
             ui.horizontal(|ui| {
                 let btn_gap = 3.0_f32;
@@ -1687,6 +1863,9 @@ fn draw_omore_punch_ui(
                             ),
                         ];
 
+                        let current_rel_mode = params.release_mode.value();
+                        let is_auto_release = current_rel_mode != ReleaseMode::Manual;
+
                         for (row_idx, chunk) in comp_knobs.chunks(UI_KNOB_COLS_MAX).enumerate() {
                             if row_idx > 0 {
                                 ui.add_space(UI_KNOB_GRID_SPACING_Y);
@@ -1694,7 +1873,9 @@ fn draw_omore_punch_ui(
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = UI_KNOB_GRID_SPACING_X;
                                 for &(param, label, step, min_val, max_val, color_family) in chunk {
-                                    draw_ssl_knob_cell(
+                                    let auto_override =
+                                        is_auto_release && std::ptr::eq(param, &params.release_ms);
+                                    draw_ssl_knob_cell_ex(
                                         ui,
                                         setter,
                                         param,
@@ -1703,10 +1884,63 @@ fn draw_omore_punch_ui(
                                         min_val,
                                         max_val,
                                         color_family,
+                                        auto_override,
                                     );
                                 }
                             });
                         }
+
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Release Mode:")
+                                    .monospace()
+                                    .strong(),
+                            );
+                            for (mode, text, hover) in [
+                                (
+                                    ReleaseMode::Manual,
+                                    "[Manual]",
+                                    "Use manual Release knob setting",
+                                ),
+                                (
+                                    ReleaseMode::AutoTight,
+                                    "[Auto Tight]",
+                                    "Dual-stage Auto-Release: ~50 ms fast / ~600 ms slow",
+                                ),
+                                (
+                                    ReleaseMode::AutoPunch,
+                                    "[Auto Punch]",
+                                    "Dual-stage Auto-Release: ~80 ms fast / ~800 ms slow",
+                                ),
+                                (
+                                    ReleaseMode::AutoGlue,
+                                    "[Auto Glue]",
+                                    "Dual-stage Auto-Release: ~100 ms fast / ~1200 ms slow",
+                                ),
+                            ] {
+                                let active = current_rel_mode == mode;
+                                let fill = if active {
+                                    egui::Color32::from_rgb(195, 125, 20)
+                                } else {
+                                    egui::Color32::from_rgb(45, 48, 58)
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new(text).monospace().strong(),
+                                        )
+                                        .fill(fill),
+                                    )
+                                    .on_hover_text(hover)
+                                    .clicked()
+                                {
+                                    setter.begin_set_parameter(&params.release_mode);
+                                    setter.set_parameter(&params.release_mode, mode);
+                                    setter.end_set_parameter(&params.release_mode);
+                                }
+                            }
+                        });
 
                         ui.add_space(2.0);
                         ui.horizontal(|ui| {
@@ -1717,7 +1951,7 @@ fn draw_omore_punch_ui(
                                         .strong(),
                                 )
                                 .on_hover_text(
-                                    "Set Omore Sampler signature Drum Bus Attack (3.0 ms) and Release (80.0 ms)",
+                                    "Set Omore Sampler signature Drum Bus Attack (3.0 ms), Manual Release (80.0 ms), and Release Mode to Manual",
                                 )
                                 .clicked()
                             {
@@ -1728,6 +1962,10 @@ fn draw_omore_punch_ui(
                                 setter.begin_set_parameter(&params.release_ms);
                                 setter.set_parameter(&params.release_ms, 80.0);
                                 setter.end_set_parameter(&params.release_ms);
+
+                                setter.begin_set_parameter(&params.release_mode);
+                                setter.set_parameter(&params.release_mode, ReleaseMode::Manual);
+                                setter.end_set_parameter(&params.release_mode);
                             }
 
                             if ui
@@ -2032,6 +2270,7 @@ mod tests {
             ratio: 4.0,
             attack_ms: 3.0,
             release_ms: 80.0,
+            release_mode: ReleaseMode::Manual,
             sc_hpf_hz: 20.0,
             auto_makeup: false,
             makeup_db: 0.0,
@@ -2093,6 +2332,7 @@ mod tests {
             ratio: 4.0,
             attack_ms: 3.0,
             release_ms: 80.0,
+            release_mode: ReleaseMode::Manual,
             sc_hpf_hz: 20.0,
             auto_makeup: false,
             makeup_db: 0.0,
@@ -2159,6 +2399,7 @@ mod tests {
             ratio: 4.0,
             attack_ms: 3.0,
             release_ms: 80.0,
+            release_mode: ReleaseMode::Manual,
             sc_hpf_hz: 20.0,
             auto_makeup: false,
             makeup_db: 0.0,
@@ -2224,6 +2465,7 @@ mod tests {
                 ratio: 1.0,
                 attack_ms: 3.0,
                 release_ms: 80.0,
+                release_mode: ReleaseMode::Manual,
                 sc_hpf_hz: 20.0,
                 auto_makeup: false,
                 makeup_db: 0.0,
@@ -2282,6 +2524,7 @@ mod tests {
             ratio: 12.0,
             attack_ms: 1.0,
             release_ms: 50.0,
+            release_mode: ReleaseMode::Manual,
             sc_hpf_hz: 90.0,
             auto_makeup: true,
             makeup_db: 6.0,
@@ -2329,63 +2572,130 @@ mod tests {
 
     #[test]
     fn test_nan_inf_and_safety_clamp() {
-        let mut dsp = StereoPunchDsp::new(48000.0);
-        let cfg = DspConfig {
-            input_db: 12.0,
-            threshold_db: -24.0,
-            ratio: 8.0,
-            attack_ms: 3.0,
-            release_ms: 80.0,
-            sc_hpf_hz: 90.0,
-            auto_makeup: true,
-            makeup_db: 24.0,
-            eq_low_cut_hz: 120.0,
-            eq_mid_cut_db: -9.0,
-            eq_high_shelf_db: 12.0,
-            clipper_mode: ClipperMode::Bypass,
-            ceiling_db: 0.0,
-            mix_pct: 100.0,
-        };
+        assert_eq!(DspConfig::default().release_mode, ReleaseMode::Manual);
+        assert_eq!(
+            OmorePunchParams::default().release_mode.value(),
+            ReleaseMode::Manual
+        );
 
+        let sr = 48000.0_f32;
         let pathological_inputs = [
             (f32::NAN, f32::NAN),
             (f32::INFINITY, f32::NEG_INFINITY),
             (1.0e30, -1.0e30),
             (0.5, -0.5),
+            (1.0e-39, -1.0e-39),
         ];
 
-        for (in_l, in_r) in pathological_inputs {
-            let out = dsp.process_sample(in_l, in_r, &cfg);
-            assert!(out.out_l.is_finite(), "Left output is not finite: {}", out.out_l);
-            assert!(out.out_r.is_finite(), "Right output is not finite: {}", out.out_r);
-            assert!(
-                out.out_l >= -SAFETY_CLAMP_LIMIT && out.out_l <= SAFETY_CLAMP_LIMIT,
-                "Left output {} out of [-4.0, 4.0] safety bounds",
-                out.out_l
-            );
-            assert!(
-                out.out_r >= -SAFETY_CLAMP_LIMIT && out.out_r <= SAFETY_CLAMP_LIMIT,
-                "Right output {} out of [-4.0, 4.0] safety bounds",
-                out.out_r
-            );
-            assert!(
-                dsp.env_gr_db.is_finite(),
-                "Internal GR envelope became non-finite"
-            );
-            for (name, biquad) in [
-                ("eq_low_cut", &dsp.eq_low_cut),
-                ("eq_mid_cut", &dsp.eq_mid_cut),
-                ("eq_high_shelf", &dsp.eq_high_shelf),
-            ] {
+        for mode in [
+            ReleaseMode::Manual,
+            ReleaseMode::AutoTight,
+            ReleaseMode::AutoPunch,
+            ReleaseMode::AutoGlue,
+        ] {
+            let mut dsp = StereoPunchDsp::new(sr);
+            let cfg = DspConfig {
+                input_db: 12.0,
+                threshold_db: -24.0,
+                ratio: 8.0,
+                attack_ms: 3.0,
+                release_ms: 80.0,
+                release_mode: mode,
+                sc_hpf_hz: 90.0,
+                auto_makeup: true,
+                makeup_db: 24.0,
+                eq_low_cut_hz: 120.0,
+                eq_mid_cut_db: -9.0,
+                eq_high_shelf_db: 12.0,
+                clipper_mode: ClipperMode::Bypass,
+                ceiling_db: 0.0,
+                mix_pct: 100.0,
+            };
+
+            for (in_l, in_r) in pathological_inputs {
+                let out = dsp.process_sample(in_l, in_r, &cfg);
                 assert!(
-                    biquad.z1_l.is_finite()
-                        && biquad.z2_l.is_finite()
-                        && biquad.z1_r.is_finite()
-                        && biquad.z2_r.is_finite(),
-                    "Internal EQ biquad states for {} became non-finite",
-                    name
+                    out.out_l.is_finite(),
+                    "[{:?}] Left output is not finite: {}",
+                    mode,
+                    out.out_l
                 );
+                assert!(
+                    out.out_r.is_finite(),
+                    "[{:?}] Right output is not finite: {}",
+                    mode,
+                    out.out_r
+                );
+                assert!(
+                    out.out_l >= -SAFETY_CLAMP_LIMIT && out.out_l <= SAFETY_CLAMP_LIMIT,
+                    "[{:?}] Left output {} out of [-4.0, 4.0] safety bounds",
+                    mode,
+                    out.out_l
+                );
+                assert!(
+                    out.out_r >= -SAFETY_CLAMP_LIMIT && out.out_r <= SAFETY_CLAMP_LIMIT,
+                    "[{:?}] Right output {} out of [-4.0, 4.0] safety bounds",
+                    mode,
+                    out.out_r
+                );
+                assert!(
+                    dsp.env_gr_db.is_finite()
+                        && (dsp.env_gr_db == 0.0 || dsp.env_gr_db.is_normal()),
+                    "[{:?}] Internal env_gr_db invalid/subnormal: {}",
+                    mode,
+                    dsp.env_gr_db
+                );
+                assert!(
+                    dsp.auto_slow_gr_db.is_finite()
+                        && (dsp.auto_slow_gr_db == 0.0 || dsp.auto_slow_gr_db.is_normal()),
+                    "[{:?}] Internal auto_slow_gr_db invalid/subnormal: {}",
+                    mode,
+                    dsp.auto_slow_gr_db
+                );
+                for (name, biquad) in [
+                    ("eq_low_cut", &dsp.eq_low_cut),
+                    ("eq_mid_cut", &dsp.eq_mid_cut),
+                    ("eq_high_shelf", &dsp.eq_high_shelf),
+                ] {
+                    assert!(
+                        biquad.z1_l.is_finite()
+                            && biquad.z2_l.is_finite()
+                            && biquad.z1_r.is_finite()
+                            && biquad.z2_r.is_finite(),
+                        "[{:?}] Internal EQ biquad states for {} became non-finite",
+                        mode,
+                        name
+                    );
+                }
             }
+
+            // Long silence tail flushes both envelope stages cleanly to exact 0.0 (no denormals)
+            for _ in 0..(60.0 * sr) as usize {
+                let out = dsp.process_sample(0.0, 0.0, &cfg);
+                assert!(
+                    dsp.env_gr_db == 0.0 || dsp.env_gr_db.is_normal(),
+                    "[{:?}] Subnormal env_gr_db during silence: {}",
+                    mode,
+                    dsp.env_gr_db
+                );
+                assert!(
+                    dsp.auto_slow_gr_db == 0.0 || dsp.auto_slow_gr_db.is_normal(),
+                    "[{:?}] Subnormal auto_slow_gr_db during silence: {}",
+                    mode,
+                    dsp.auto_slow_gr_db
+                );
+                assert!(out.out_l.is_finite() && out.out_r.is_finite());
+            }
+            assert_eq!(
+                dsp.env_gr_db, 0.0,
+                "[{:?}] env_gr_db failed to flush to 0.0 on silence",
+                mode
+            );
+            assert_eq!(
+                dsp.auto_slow_gr_db, 0.0,
+                "[{:?}] auto_slow_gr_db failed to flush to 0.0 on silence",
+                mode
+            );
         }
     }
 
@@ -2756,10 +3066,10 @@ mod tests {
             UI_KNOB_CELL_WIDTH
         );
 
-        // Combined left-column sections (Section 1: 2 knob rows + quick buttons; Section 2:
-        // clipper mode row + 1 knob row; Section 3: 1 EQ knob row; group headers, separators,
-        // margins and gaps) fit within CentralPanel height
-        // (UI_WINDOW_HEIGHT - header_and_panel_margins_px = 572.0 px).
+        // Combined left-column sections (Section 1: 2 knob rows + Release Mode row + quick
+        // preset row; Section 2: clipper mode row + 1 knob row; Section 3: 1 EQ knob row;
+        // group headers, separators, margins and gaps) fit within CentralPanel height
+        // (UI_WINDOW_HEIGHT - header_and_panel_margins_px = 602.0 px).
         let header_and_panel_margins_px = 48.0_f32;
         let available_left_col_height =
             UI_WINDOW_HEIGHT as f32 - header_and_panel_margins_px;
@@ -2768,6 +3078,8 @@ mod tests {
         let section1_height = group_header_and_margins_px
             + 2.0 * UI_KNOB_CELL_HEIGHT
             + UI_KNOB_GRID_SPACING_Y
+            + 2.0
+            + action_row_height_px
             + 2.0
             + action_row_height_px;
         let section2_height =
@@ -2787,7 +3099,8 @@ mod tests {
             available_left_col_height
         );
 
-        // Empirically verify rendered egui layout fits within 820x620 px
+        // Empirically verify rendered egui layout fits within 820x650 px in both Manual and
+        // AutoTight worst-case ("AUTO (500.0 ms)") readout configurations.
         struct DummyGuiContext;
         impl GuiContext for DummyGuiContext {
             fn plugin_api(&self) -> PluginApi {
@@ -2809,75 +3122,93 @@ mod tests {
             fn set_state(&self, _state: PluginState) {}
         }
 
-        let ctx = egui::Context::default();
-        let params = Arc::new(OmorePunchParams::default());
-        let telemetry = Arc::new(MeterTelemetry::default());
-        let dummy_gui = DummyGuiContext;
-        let setter = ParamSetter::new(&dummy_gui);
-        let raw_input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(UI_WINDOW_WIDTH as f32, UI_WINDOW_HEIGHT as f32),
-            )),
-            ..Default::default()
+        let assert_ui_fits = |label: &str, params: Arc<OmorePunchParams>| {
+            let ctx = egui::Context::default();
+            let telemetry = Arc::new(MeterTelemetry::default());
+            let dummy_gui = DummyGuiContext;
+            let setter = ParamSetter::new(&dummy_gui);
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(UI_WINDOW_WIDTH as f32, UI_WINDOW_HEIGHT as f32),
+                )),
+                ..Default::default()
+            };
+
+            let mut final_output = None;
+            for _ in 0..2 {
+                final_output = Some(ctx.run(raw_input.clone(), |ctx| {
+                    draw_omore_punch_ui(ctx, &setter, &params, &telemetry);
+                }));
+            }
+            let used = ctx.used_rect();
+            let shapes = final_output.expect("egui frame output missing").shapes;
+            let max_shape_bottom = shapes
+                .iter()
+                .map(|clipped| clipped.shape.visual_bounding_rect().bottom())
+                .fold(0.0_f32, f32::max);
+            let max_inner_bottom = shapes
+                .iter()
+                .filter_map(|clipped| {
+                    let rect = clipped.shape.visual_bounding_rect();
+                    (rect.width() < UI_WINDOW_WIDTH as f32 - 1.0).then_some(rect.bottom())
+                })
+                .fold(0.0_f32, f32::max);
+            let max_inner_right = shapes
+                .iter()
+                .filter_map(|clipped| {
+                    let rect = clipped.shape.visual_bounding_rect();
+                    (rect.width() < UI_WINDOW_WIDTH as f32 - 1.0).then_some(rect.right())
+                })
+                .fold(0.0_f32, f32::max);
+            assert!(
+                used.width() <= UI_WINDOW_WIDTH as f32,
+                "[{}] Rendered egui width ({}) exceeds window width ({})",
+                label,
+                used.width(),
+                UI_WINDOW_WIDTH
+            );
+            assert!(
+                used.height() <= UI_WINDOW_HEIGHT as f32,
+                "[{}] Rendered egui height ({}) exceeds window height ({})",
+                label,
+                used.height(),
+                UI_WINDOW_HEIGHT
+            );
+            assert!(
+                max_shape_bottom <= UI_WINDOW_HEIGHT as f32,
+                "[{}] Painted egui widgets bottom ({}) overflows window height ({})",
+                label,
+                max_shape_bottom,
+                UI_WINDOW_HEIGHT
+            );
+            assert!(
+                max_inner_bottom <= UI_WINDOW_HEIGHT as f32 - 6.0,
+                "[{}] Inner widgets bottom ({}) exceeds padded window height ({})",
+                label,
+                max_inner_bottom,
+                UI_WINDOW_HEIGHT as f32 - 6.0
+            );
+            assert!(
+                max_inner_right <= UI_WINDOW_WIDTH as f32 - 6.0,
+                "[{}] Inner widgets right ({}) exceeds padded window width ({})",
+                label,
+                max_inner_right,
+                UI_WINDOW_WIDTH as f32 - 6.0
+            );
         };
 
-        let mut final_output = None;
-        for _ in 0..2 {
-            final_output = Some(ctx.run(raw_input.clone(), |ctx| {
-                draw_omore_punch_ui(ctx, &setter, &params, &telemetry);
-            }));
-        }
-        let used = ctx.used_rect();
-        let shapes = final_output.expect("egui frame output missing").shapes;
-        let max_shape_bottom = shapes
-            .iter()
-            .map(|clipped| clipped.shape.visual_bounding_rect().bottom())
-            .fold(0.0_f32, f32::max);
-        let max_inner_bottom = shapes
-            .iter()
-            .filter_map(|clipped| {
-                let rect = clipped.shape.visual_bounding_rect();
-                (rect.width() < UI_WINDOW_WIDTH as f32 - 1.0).then_some(rect.bottom())
-            })
-            .fold(0.0_f32, f32::max);
-        let max_inner_right = shapes
-            .iter()
-            .filter_map(|clipped| {
-                let rect = clipped.shape.visual_bounding_rect();
-                (rect.width() < UI_WINDOW_WIDTH as f32 - 1.0).then_some(rect.right())
-            })
-            .fold(0.0_f32, f32::max);
-        assert!(
-            used.width() <= UI_WINDOW_WIDTH as f32,
-            "Rendered egui width ({}) exceeds window width ({})",
-            used.width(),
-            UI_WINDOW_WIDTH
-        );
-        assert!(
-            used.height() <= UI_WINDOW_HEIGHT as f32,
-            "Rendered egui height ({}) exceeds window height ({})",
-            used.height(),
-            UI_WINDOW_HEIGHT
-        );
-        assert!(
-            max_shape_bottom <= UI_WINDOW_HEIGHT as f32,
-            "Painted egui widgets bottom ({}) overflows window height ({})",
-            max_shape_bottom,
-            UI_WINDOW_HEIGHT
-        );
-        assert!(
-            max_inner_bottom <= UI_WINDOW_HEIGHT as f32 - 6.0,
-            "Inner widgets bottom ({}) exceeds padded window height ({})",
-            max_inner_bottom,
-            UI_WINDOW_HEIGHT as f32 - 6.0
-        );
-        assert!(
-            max_inner_right <= UI_WINDOW_WIDTH as f32 - 6.0,
-            "Inner widgets right ({}) exceeds padded window width ({})",
-            max_inner_right,
-            UI_WINDOW_WIDTH as f32 - 6.0
-        );
+        let manual_params = Arc::new(OmorePunchParams::default());
+        assert_ui_fits("manual_default", manual_params);
+
+        let auto_params = OmorePunchParams {
+            release_mode: EnumParam::new("Release Mode", ReleaseMode::AutoTight),
+            release_ms: make_release_ms_param(500.0),
+            ..OmorePunchParams::default()
+        };
+        assert_eq!(auto_params.release_mode.value(), ReleaseMode::AutoTight);
+        assert_eq!(auto_params.release_ms.value(), 500.0);
+        assert_ui_fits("auto_tight_500ms", Arc::new(auto_params));
     }
 
     #[test]
@@ -2989,5 +3320,317 @@ mod tests {
                 UI_WINDOW_HEIGHT
             );
         }
+    }
+
+    fn measure_recovery_samples_to_90pct(
+        sample_rate: f32,
+        mode: ReleaseMode,
+        burst_ms: f32,
+    ) -> (usize, f32) {
+        let mut dsp = StereoPunchDsp::new(sample_rate);
+        let cfg = DspConfig {
+            input_db: 0.0,
+            threshold_db: -24.0,
+            ratio: 8.0,
+            attack_ms: 1.0,
+            release_ms: 80.0,
+            release_mode: mode,
+            sc_hpf_hz: 20.0,
+            auto_makeup: false,
+            clipper_mode: ClipperMode::Bypass,
+            ..DspConfig::default()
+        };
+
+        let burst_samples = ((burst_ms * 0.001) * sample_rate).round() as usize;
+        let mut peak_gr = 0.0_f32;
+        for n in 0..burst_samples {
+            let phase = 2.0 * std::f32::consts::PI * 1000.0 * (n as f32) / sample_rate;
+            let s = 0.8_f32 * phase.sin();
+            let out = dsp.process_sample(s, s, &cfg);
+            peak_gr = peak_gr.max(out.gr_db);
+        }
+
+        let target_recovered_gr = peak_gr * 0.10;
+        let max_release_samples = (6.0 * sample_rate).round() as usize;
+        for n in 1..=max_release_samples {
+            let out = dsp.process_sample(0.0, 0.0, &cfg);
+            if out.gr_db <= target_recovered_gr {
+                return (n, peak_gr);
+            }
+        }
+
+        (max_release_samples, peak_gr)
+    }
+
+    #[test]
+    fn test_auto_release_transient_vs_sustained_recovery() {
+        for mode in [
+            ReleaseMode::AutoTight,
+            ReleaseMode::AutoPunch,
+            ReleaseMode::AutoGlue,
+        ] {
+            let mut short_ms_per_sr = Vec::new();
+            let mut long_ms_per_sr = Vec::new();
+
+            for sr in [44100.0_f32, 48000.0_f32, 96000.0_f32] {
+                let (short_samples, short_peak) =
+                    measure_recovery_samples_to_90pct(sr, mode, 15.0);
+                let (long_samples, long_peak) =
+                    measure_recovery_samples_to_90pct(sr, mode, 400.0);
+
+                assert!(
+                    short_peak > 8.0 && long_peak > 8.0,
+                    "Mode {:?} sr={}: expected > 8 dB GR (short={:.2}, long={:.2})",
+                    mode,
+                    sr,
+                    short_peak,
+                    long_peak
+                );
+                assert!(
+                    (long_samples as f32) >= (short_samples as f32) * 2.0,
+                    "Mode {:?} sr={}: expected short burst recovery ({} samp) >= 2x faster than sustained ({} samp)",
+                    mode,
+                    sr,
+                    short_samples,
+                    long_samples
+                );
+
+                short_ms_per_sr.push((short_samples as f32) * 1000.0 / sr);
+                long_ms_per_sr.push((long_samples as f32) * 1000.0 / sr);
+            }
+
+            let short_spread = short_ms_per_sr
+                .iter()
+                .copied()
+                .fold(0.0_f32, f32::max)
+                - short_ms_per_sr
+                    .iter()
+                    .copied()
+                    .fold(f32::INFINITY, f32::min);
+            let long_spread = long_ms_per_sr
+                .iter()
+                .copied()
+                .fold(0.0_f32, f32::max)
+                - long_ms_per_sr
+                    .iter()
+                    .copied()
+                    .fold(f32::INFINITY, f32::min);
+            assert!(
+                short_spread < 10.0,
+                "Mode {:?}: short recovery time spread across 44.1/48/96k too large ({:.2} ms)",
+                mode,
+                short_spread
+            );
+            assert!(
+                long_spread < 25.0,
+                "Mode {:?}: sustained recovery time spread across 44.1/48/96k too large ({:.2} ms)",
+                mode,
+                long_spread
+            );
+        }
+    }
+
+    #[test]
+    fn test_auto_release_profile_ordering() {
+        let sr = 48000.0_f32;
+        let (tight_short, _) = measure_recovery_samples_to_90pct(sr, ReleaseMode::AutoTight, 15.0);
+        let (punch_short, _) = measure_recovery_samples_to_90pct(sr, ReleaseMode::AutoPunch, 15.0);
+        let (glue_short, _) = measure_recovery_samples_to_90pct(sr, ReleaseMode::AutoGlue, 15.0);
+        assert!(
+            tight_short < punch_short && punch_short < glue_short,
+            "Short burst recovery must order AutoTight ({}) < AutoPunch ({}) < AutoGlue ({})",
+            tight_short,
+            punch_short,
+            glue_short
+        );
+
+        let (tight_long, _) = measure_recovery_samples_to_90pct(sr, ReleaseMode::AutoTight, 400.0);
+        let (punch_long, _) = measure_recovery_samples_to_90pct(sr, ReleaseMode::AutoPunch, 400.0);
+        let (glue_long, _) = measure_recovery_samples_to_90pct(sr, ReleaseMode::AutoGlue, 400.0);
+        assert!(
+            tight_long < punch_long && punch_long < glue_long,
+            "Sustained recovery must order AutoTight ({}) < AutoPunch ({}) < AutoGlue ({})",
+            tight_long,
+            punch_long,
+            glue_long
+        );
+    }
+
+    #[test]
+    fn test_auto_release_manual_bit_exact_compatibility() {
+        let sr = 48000.0_f32;
+
+        // 1. In Manual mode, manual release_ms controls recovery directly via single exponential stage
+        let (manual_fast, _) =
+            measure_recovery_samples_to_90pct(sr, ReleaseMode::Manual, 400.0);
+        let mut dsp_manual_slow = StereoPunchDsp::new(sr);
+        let cfg_manual_slow = DspConfig {
+            input_db: 0.0,
+            threshold_db: -24.0,
+            ratio: 8.0,
+            attack_ms: 1.0,
+            release_ms: 320.0,
+            release_mode: ReleaseMode::Manual,
+            sc_hpf_hz: 20.0,
+            auto_makeup: false,
+            clipper_mode: ClipperMode::Bypass,
+            ..DspConfig::default()
+        };
+        let burst = (0.4 * sr) as usize;
+        let mut peak = 0.0_f32;
+        for n in 0..burst {
+            let phase = 2.0 * std::f32::consts::PI * 1000.0 * (n as f32) / sr;
+            let s = 0.8_f32 * phase.sin();
+            peak = peak.max(dsp_manual_slow.process_sample(s, s, &cfg_manual_slow).gr_db);
+        }
+        let mut manual_slow = 0_usize;
+        for n in 1..=(6.0 * sr) as usize {
+            if dsp_manual_slow
+                .process_sample(0.0, 0.0, &cfg_manual_slow)
+                .gr_db
+                <= peak * 0.10
+            {
+                manual_slow = n;
+                break;
+            }
+        }
+        assert!(
+            manual_slow > manual_fast * 3,
+            "Manual mode must scale with manual release_ms (80ms={} vs 320ms={})",
+            manual_fast,
+            manual_slow
+        );
+
+        // Verify Manual release follows single-stage exponential decay from steady GR
+        let mut dsp_exp = StereoPunchDsp::new(sr);
+        let cfg_manual_80 = DspConfig {
+            release_ms: 80.0,
+            ..cfg_manual_slow
+        };
+        for _ in 0..2000 {
+            dsp_exp.process_sample(0.8, 0.8, &cfg_manual_80);
+        }
+        let gr_start = dsp_exp.env_gr_db;
+        let coeff = (-1.0_f32 / (0.080 * sr)).exp();
+        for step in 1..=2000 {
+            let out = dsp_exp.process_sample(0.0, 0.0, &cfg_manual_80);
+            let expected = gr_start * coeff.powi(step);
+            assert!(
+                (out.gr_db - expected).abs() < 1.0e-4,
+                "Manual release step {} deviated from single-stage exponential: got {} expected {}",
+                step,
+                out.gr_db,
+                expected
+            );
+        }
+
+        // 2. In every Auto-Release mode, manual release_ms has zero effect on output or GR
+        for mode in [
+            ReleaseMode::AutoTight,
+            ReleaseMode::AutoPunch,
+            ReleaseMode::AutoGlue,
+        ] {
+            let mut dsp_a = StereoPunchDsp::new(sr);
+            let mut dsp_b = StereoPunchDsp::new(sr);
+            let cfg_a = DspConfig {
+                release_ms: 10.0,
+                release_mode: mode,
+                ..cfg_manual_slow
+            };
+            let cfg_b = DspConfig {
+                release_ms: 500.0,
+                release_mode: mode,
+                ..cfg_manual_slow
+            };
+
+            for n in 0..20000 {
+                let s = if n < 4800 {
+                    let phase = 2.0 * std::f32::consts::PI * 1000.0 * (n as f32) / sr;
+                    0.8 * phase.sin()
+                } else {
+                    0.0
+                };
+                let out_a = dsp_a.process_sample(s, -s * 0.7, &cfg_a);
+                let out_b = dsp_b.process_sample(s, -s * 0.7, &cfg_b);
+                assert_eq!(out_a.out_l.to_bits(), out_b.out_l.to_bits());
+                assert_eq!(out_a.out_r.to_bits(), out_b.out_r.to_bits());
+                assert_eq!(out_a.gr_db.to_bits(), out_b.gr_db.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn test_auto_release_mode_switch_continuity_and_stereo_link() {
+        let sr = 48000.0_f32;
+        let mut dsp = StereoPunchDsp::new(sr);
+        let schedule = [
+            ReleaseMode::Manual,
+            ReleaseMode::AutoTight,
+            ReleaseMode::AutoPunch,
+            ReleaseMode::AutoGlue,
+            ReleaseMode::Manual,
+        ];
+
+        let mut cfg = DspConfig {
+            input_db: 0.0,
+            threshold_db: -24.0,
+            ratio: 8.0,
+            attack_ms: 1.0,
+            release_ms: 80.0,
+            release_mode: ReleaseMode::Manual,
+            sc_hpf_hz: 20.0,
+            auto_makeup: false,
+            clipper_mode: ClipperMode::Bypass,
+            ..DspConfig::default()
+        };
+
+        let mut prev_gr_db = 0.0_f32;
+        let mut max_gr_jump_db = 0.0_f32;
+
+        // Exercise transitions both during active sustained compression and during release
+        for phase_idx in 0..2 {
+            for (seg_idx, &mode) in schedule.iter().enumerate() {
+                cfg.release_mode = mode;
+                let seg_len = 2400_usize;
+                for n in 0..seg_len {
+                    let global_n = (phase_idx * schedule.len() + seg_idx) * seg_len + n;
+                    let amp = if phase_idx == 0 || (seg_idx % 2 == 0) {
+                        0.8_f32
+                    } else {
+                        0.05_f32
+                    };
+                    let phase = 2.0 * std::f32::consts::PI * 1000.0 * (global_n as f32) / sr;
+                    let s = phase.sin();
+                    let in_l = amp * s;
+                    let in_r = (amp * 0.25) * s;
+
+                    let out = dsp.process_sample(in_l, in_r, &cfg);
+                    assert!(out.out_l.is_finite() && out.out_r.is_finite());
+                    assert!(out.gr_db.is_finite());
+
+                    if global_n > 0 {
+                        let jump = (out.gr_db - prev_gr_db).abs();
+                        max_gr_jump_db = max_gr_jump_db.max(jump);
+                    }
+                    prev_gr_db = out.gr_db;
+
+                    // Stereo-linked detector must apply identical gain to L and R despite 12 dB offset
+                    assert!(
+                        (out.out_r - 0.25 * out.out_l).abs() < 1.0e-5,
+                        "Stereo link imbalance at mode {:?} sample {}: L={}, R={}",
+                        mode,
+                        global_n,
+                        out.out_l,
+                        out.out_r
+                    );
+                }
+            }
+        }
+
+        assert!(
+            max_gr_jump_db <= 1.0,
+            "Sample-to-sample GR jump {} dB exceeded 1.0 dB threshold during mode switches",
+            max_gr_jump_db
+        );
     }
 }
