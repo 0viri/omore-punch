@@ -18,6 +18,13 @@ const MIN_DETECTOR_PEAK: f32 = 1.0e-6;
 const MIN_FLOOR_DB: f32 = -60.0;
 const MAX_GR_METER_DB: f32 = 24.0;
 const AUTO_SLOW_CHARGE_MS: f32 = 180.0;
+const GAIN_MATCH_RMS_MS: f32 = 400.0;
+const GAIN_MATCH_PRESENCE_MS: f32 = 50.0;
+const GAIN_MATCH_SLEW_MS: f32 = 150.0;
+const GAIN_MATCH_TOGGLE_SLEW_MS: f32 = 35.0;
+const GAIN_MATCH_NOISE_FLOOR_POWER: f32 = 1.0e-6;
+const GAIN_MATCH_MIN_DB: f32 = -24.0;
+const GAIN_MATCH_MAX_DB: f32 = 24.0;
 
 // ----------------------------------------------------------------------------
 // Helper Functions for Lock-Free Atomic f32 Storage
@@ -204,6 +211,7 @@ pub struct DspConfig {
     pub clipper_mode: ClipperMode,
     pub ceiling_db: f32,
     pub mix_pct: f32,
+    pub gain_match: bool,
 }
 
 impl Default for DspConfig {
@@ -224,6 +232,7 @@ impl Default for DspConfig {
             clipper_mode: ClipperMode::SoftClip,
             ceiling_db: 0.0,
             mix_pct: 100.0,
+            gain_match: false,
         }
     }
 }
@@ -234,6 +243,7 @@ pub struct SampleOutput {
     pub out_r: f32,
     pub gr_db: f32,
     pub clipped: bool,
+    pub gain_match_db: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -260,6 +270,14 @@ pub struct StereoPunchDsp {
     cached_eq_low_cut_hz: f32,
     cached_eq_mid_cut_db: f32,
     cached_eq_high_shelf_db: f32,
+    gm_rms_coeff: f32,
+    gm_presence_coeff: f32,
+    gm_slew_coeff: f32,
+    gm_off_slew_coeff: f32,
+    gm_in_ms: f32,
+    gm_post_ms: f32,
+    gm_presence_ms: f32,
+    pub gm_gain_db: f32,
     auto_slow_gr_db: f32,
     pub env_gr_db: f32,
 }
@@ -289,12 +307,21 @@ impl Default for StereoPunchDsp {
             cached_eq_low_cut_hz: -1.0,
             cached_eq_mid_cut_db: -999.0,
             cached_eq_high_shelf_db: -999.0,
+            gm_rms_coeff: 0.0,
+            gm_presence_coeff: 0.0,
+            gm_slew_coeff: 0.0,
+            gm_off_slew_coeff: 0.0,
+            gm_in_ms: 0.0,
+            gm_post_ms: 0.0,
+            gm_presence_ms: 0.0,
+            gm_gain_db: 0.0,
             auto_slow_gr_db: 0.0,
             env_gr_db: 0.0,
         };
         dsp.update_ballistics(48000.0, 3.0, 80.0, ReleaseMode::Manual);
         dsp.update_sidechain_hpf(48000.0, 20.0);
         dsp.update_eq(48000.0, 20.0, 0.0, 0.0);
+        dsp.update_gain_match_coeffs(48000.0);
         dsp
     }
 }
@@ -313,9 +340,22 @@ impl StereoPunchDsp {
     }
 
     #[inline(always)]
+    fn update_gain_match_coeffs(&mut self, sample_rate: f32) {
+        let sr = sample_rate.max(8000.0);
+        self.gm_rms_coeff = Self::exp_coeff_from_ms(GAIN_MATCH_RMS_MS, sr, 0.001);
+        self.gm_presence_coeff = Self::exp_coeff_from_ms(GAIN_MATCH_PRESENCE_MS, sr, 0.001);
+        self.gm_slew_coeff = Self::exp_coeff_from_ms(GAIN_MATCH_SLEW_MS, sr, 0.001);
+        self.gm_off_slew_coeff = Self::exp_coeff_from_ms(GAIN_MATCH_TOGGLE_SLEW_MS, sr, 0.001);
+    }
+
+    #[inline(always)]
     pub fn reset(&mut self) {
         self.env_gr_db = 0.0;
         self.auto_slow_gr_db = 0.0;
+        self.gm_in_ms = 0.0;
+        self.gm_post_ms = 0.0;
+        self.gm_presence_ms = 0.0;
+        self.gm_gain_db = 0.0;
         self.sc_prev_in_l = 0.0;
         self.sc_prev_in_r = 0.0;
         self.sc_prev_out_l = 0.0;
@@ -355,6 +395,7 @@ impl StereoPunchDsp {
             self.update_ballistics(sr, att, rel, rel_mode);
             self.update_sidechain_hpf(sr, hpf);
             self.update_eq(sr, eq_lc, eq_mc, eq_hs);
+            self.update_gain_match_coeffs(sr);
         }
     }
 
@@ -378,6 +419,7 @@ impl StereoPunchDsp {
             self.cached_eq_low_cut_hz = -1.0;
             self.cached_eq_mid_cut_db = -999.0;
             self.cached_eq_high_shelf_db = -999.0;
+            self.update_gain_match_coeffs(sr);
         }
 
         if sr_changed || att_changed {
@@ -752,15 +794,77 @@ impl StereoPunchDsp {
             )
         };
 
+        // 8. Post-Processing Gain Match (Feed-Forward Stereo-Linked RMS)
+        let in_sq = 0.5 * (dry_l * dry_l + dry_r * dry_r);
+        let post_sq = 0.5 * (mixed_l * mixed_l + mixed_r * mixed_r);
+
+        // Fast presence detector freezes (Hold) RMS & trim below -60 dBFS
+        let next_presence =
+            self.gm_presence_coeff * self.gm_presence_ms + (1.0 - self.gm_presence_coeff) * in_sq;
+        self.gm_presence_ms = if next_presence.is_finite() && next_presence > 1.0e-20 {
+            next_presence
+        } else {
+            0.0
+        };
+
+        if self.gm_presence_ms >= GAIN_MATCH_NOISE_FLOOR_POWER {
+            let next_in_ms =
+                self.gm_rms_coeff * self.gm_in_ms + (1.0 - self.gm_rms_coeff) * in_sq;
+            let next_post_ms =
+                self.gm_rms_coeff * self.gm_post_ms + (1.0 - self.gm_rms_coeff) * post_sq;
+
+            self.gm_in_ms = if next_in_ms.is_finite() && next_in_ms > 1.0e-20 {
+                next_in_ms
+            } else {
+                0.0
+            };
+            self.gm_post_ms = if next_post_ms.is_finite() && next_post_ms > 1.0e-20 {
+                next_post_ms
+            } else {
+                0.0
+            };
+
+            if cfg.gain_match {
+                let ratio_power =
+                    self.gm_in_ms.max(1.0e-12) / self.gm_post_ms.max(1.0e-12);
+                let target_db = (10.0 * ratio_power.log10())
+                    .clamp(GAIN_MATCH_MIN_DB, GAIN_MATCH_MAX_DB);
+                self.gm_gain_db =
+                    self.gm_slew_coeff * self.gm_gain_db + (1.0 - self.gm_slew_coeff) * target_db;
+            }
+        }
+
+        if !cfg.gain_match {
+            self.gm_gain_db *= self.gm_off_slew_coeff;
+            if !self.gm_gain_db.is_finite() || self.gm_gain_db.abs() < 1.0e-5 {
+                self.gm_gain_db = 0.0;
+            }
+        } else if !self.gm_gain_db.is_finite() || self.gm_gain_db.abs() < 1.0e-20 {
+            self.gm_gain_db = 0.0;
+        } else {
+            self.gm_gain_db = self.gm_gain_db.clamp(GAIN_MATCH_MIN_DB, GAIN_MATCH_MAX_DB);
+        }
+
+        let (matched_l, matched_r, gain_match_clipped) = if self.gm_gain_db != 0.0 {
+            let gm_lin = db_to_lin(self.gm_gain_db);
+            let ml = mixed_l * gm_lin;
+            let mr = mixed_r * gm_lin;
+            let over = cfg.gain_match && (ml.abs() > 1.0 || mr.abs() > 1.0);
+            (ml, mr, over)
+        } else {
+            (mixed_l, mixed_r, false)
+        };
+
         // Final Safety Sanitization & Clamp [-4.0, 4.0]
-        let out_l = sanitize_sample(mixed_l);
-        let out_r = sanitize_sample(mixed_r);
+        let out_l = sanitize_sample(matched_l);
+        let out_r = sanitize_sample(matched_r);
 
         SampleOutput {
             out_l,
             out_r,
             gr_db: self.env_gr_db,
-            clipped,
+            clipped: clipped || gain_match_clipped,
+            gain_match_db: self.gm_gain_db,
         }
     }
 }
@@ -779,6 +883,8 @@ pub struct MeterTelemetry {
     pub current_gr_db: AtomicU32,
     /// Maximum peak gain reduction held in positive dB
     pub max_gr_db: AtomicU32,
+    /// Current applied Gain Match compensation trim in dB
+    pub gain_match_db: AtomicU32,
     /// Clipper activity indicator latch
     pub clip_latched: AtomicBool,
 }
@@ -840,6 +946,9 @@ pub struct OmorePunchParams {
 
     #[id = "mix_pct"]
     pub mix_pct: FloatParam,
+
+    #[id = "gain_match"]
+    pub gain_match: BoolParam,
 
     /// Readout parameter exposed to Reaper TCP/MCP so the user can also embed
     /// or monitor Gain Reduction (dB) as a track control / automation lane.
@@ -1010,6 +1119,8 @@ impl Default for OmorePunchParams {
             .with_unit(" %")
             .with_value_to_string(formatters::v2s_f32_rounded(1)),
 
+            gain_match: BoolParam::new("Gain Match", false),
+
             gr_meter_db: FloatParam::new(
                 "Gain Reduction (dB)",
                 0.0,
@@ -1128,6 +1239,7 @@ impl Plugin for OmorePunch {
         let auto_makeup = self.params.auto_makeup.value();
         let release_mode = self.params.release_mode.value();
         let clipper_mode = self.params.clipper_mode.value();
+        let gain_match = self.params.gain_match.value();
 
         for mut channel_samples in buffer.iter_samples() {
             if channel_samples.len() < 2 {
@@ -1150,6 +1262,7 @@ impl Plugin for OmorePunch {
                 clipper_mode,
                 ceiling_db: self.params.ceiling_db.smoothed.next(),
                 mix_pct: self.params.mix_pct.smoothed.next(),
+                gain_match,
             };
 
             let raw_l = *channel_samples.get_mut(0).unwrap();
@@ -1185,6 +1298,7 @@ impl Plugin for OmorePunch {
         store_f32_relaxed(&self.telemetry.out_peak_l, block_out_l.max(prev_out_l));
         store_f32_relaxed(&self.telemetry.out_peak_r, block_out_r.max(prev_out_r));
         store_f32_relaxed(&self.telemetry.current_gr_db, self.dsp.env_gr_db);
+        store_f32_relaxed(&self.telemetry.gain_match_db, self.dsp.gm_gain_db);
 
         let held_max_gr = load_f32_relaxed(&self.telemetry.max_gr_db);
         if block_max_gr > held_max_gr {
@@ -1217,7 +1331,7 @@ const UI_KNOB_GRID_SPACING_Y: f32 = 4.0;
 const UI_KNOB_STEP_BTN_WIDTH: f32 = 22.0;
 const UI_KNOB_RESET_BTN_WIDTH: f32 = 46.0;
 const UI_KNOB_BTN_HEIGHT: f32 = 16.0;
-const UI_METER_HEIGHT: f32 = 416.0;
+const UI_METER_HEIGHT: f32 = 384.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SslKnobColor {
@@ -1763,6 +1877,13 @@ fn draw_omore_punch_ui(
     let out_r = load_f32_relaxed(&telemetry.out_peak_r);
     let current_gr_db = load_f32_relaxed(&telemetry.current_gr_db);
     let max_gr_db = load_f32_relaxed(&telemetry.max_gr_db);
+    let gain_match_db_raw = load_f32_relaxed(&telemetry.gain_match_db);
+    let gain_match_db_display =
+        if !gain_match_db_raw.is_finite() || gain_match_db_raw.abs() < 0.05 {
+            0.0
+        } else {
+            gain_match_db_raw
+        };
 
     // Keep Reaper's readable GR parameter synchronized while UI is open
     let target_gr_param = (-current_gr_db).clamp(-MAX_GR_METER_DB, 0.0);
@@ -2194,7 +2315,56 @@ fn draw_omore_punch_ui(
                             });
                         });
 
-                        ui.add_space(8.0);
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let gain_match_on = params.gain_match.value();
+                            let gm_label = if gain_match_on {
+                                "[Gain Match: ON]"
+                            } else {
+                                "[Gain Match: OFF]"
+                            };
+                            let gm_fill = if gain_match_on {
+                                egui::Color32::from_rgb(195, 125, 20)
+                            } else {
+                                egui::Color32::from_rgb(45, 48, 58)
+                            };
+                            if ui
+                                .add_sized(
+                                    [158.0, 24.0],
+                                    egui::Button::new(
+                                        egui::RichText::new(gm_label).monospace().strong(),
+                                    )
+                                    .fill(gm_fill),
+                                )
+                                .on_hover_text(
+                                    "Match post-processing output RMS volume to raw input level",
+                                )
+                                .clicked()
+                            {
+                                setter.begin_set_parameter(&params.gain_match);
+                                setter.set_parameter(&params.gain_match, !gain_match_on);
+                                setter.end_set_parameter(&params.gain_match);
+                            }
+
+                            ui.add_space(6.0);
+                            let trim_color = if gain_match_on {
+                                egui::Color32::from_rgb(245, 185, 35)
+                            } else {
+                                egui::Color32::from_rgb(145, 150, 162)
+                            };
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Trim: {:+.1} dB",
+                                    gain_match_db_display
+                                ))
+                                .monospace()
+                                .strong()
+                                .size(13.5)
+                                .color(trim_color),
+                            );
+                        });
+
+                        ui.add_space(6.0);
 
                         // Vertical Meters Row: In L/R, Out L/R, and Reaper-Style Top-Down GR Bar
                         ui.horizontal(|ui| {
@@ -2280,6 +2450,7 @@ mod tests {
             clipper_mode: ClipperMode::Bypass,
             ceiling_db: 0.0,
             mix_pct: 100.0,
+            gain_match: false,
         };
 
         // Left channel is at 0.5 (-6.0206 dBFS), Right channel is at 0.1 (-20.0 dBFS).
@@ -2291,6 +2462,7 @@ mod tests {
             out_r: 0.0,
             gr_db: 0.0,
             clipped: false,
+            gain_match_db: 0.0,
         };
 
         for _ in 0..4000 {
@@ -2342,6 +2514,7 @@ mod tests {
             clipper_mode: ClipperMode::Bypass,
             ceiling_db: 0.0,
             mix_pct: 100.0,
+            gain_match: false,
         };
 
         let cfg_filtered = DspConfig {
@@ -2409,6 +2582,7 @@ mod tests {
             clipper_mode: ClipperMode::Bypass,
             ceiling_db: 0.0,
             mix_pct: 100.0,
+            gain_match: false,
         };
 
         let cfg_snare_safe = DspConfig {
@@ -2475,6 +2649,7 @@ mod tests {
                 clipper_mode: mode,
                 ceiling_db,
                 mix_pct: 100.0,
+                gain_match: false,
             };
 
             let out = dsp.process_sample(1.2, -1.8, &cfg);
@@ -2534,6 +2709,7 @@ mod tests {
             clipper_mode: ClipperMode::HardClip,
             ceiling_db: -4.0,
             mix_pct: 0.0,
+            gain_match: false,
         };
         let out_zero = dsp_dry.process_sample(dry_l, dry_r, &cfg_zero_mix);
         assert_eq!(
@@ -2593,109 +2769,138 @@ mod tests {
             ReleaseMode::AutoPunch,
             ReleaseMode::AutoGlue,
         ] {
-            let mut dsp = StereoPunchDsp::new(sr);
-            let cfg = DspConfig {
-                input_db: 12.0,
-                threshold_db: -24.0,
-                ratio: 8.0,
-                attack_ms: 3.0,
-                release_ms: 80.0,
-                release_mode: mode,
-                sc_hpf_hz: 90.0,
-                auto_makeup: true,
-                makeup_db: 24.0,
-                eq_low_cut_hz: 120.0,
-                eq_mid_cut_db: -9.0,
-                eq_high_shelf_db: 12.0,
-                clipper_mode: ClipperMode::Bypass,
-                ceiling_db: 0.0,
-                mix_pct: 100.0,
-            };
+            for gain_match in [false, true] {
+                let mut dsp = StereoPunchDsp::new(sr);
+                let cfg = DspConfig {
+                    input_db: 12.0,
+                    threshold_db: -24.0,
+                    ratio: 8.0,
+                    attack_ms: 3.0,
+                    release_ms: 80.0,
+                    release_mode: mode,
+                    sc_hpf_hz: 90.0,
+                    auto_makeup: true,
+                    makeup_db: 24.0,
+                    eq_low_cut_hz: 120.0,
+                    eq_mid_cut_db: -9.0,
+                    eq_high_shelf_db: 12.0,
+                    clipper_mode: ClipperMode::Bypass,
+                    ceiling_db: 0.0,
+                    mix_pct: 100.0,
+                    gain_match,
+                };
 
-            for (in_l, in_r) in pathological_inputs {
-                let out = dsp.process_sample(in_l, in_r, &cfg);
-                assert!(
-                    out.out_l.is_finite(),
-                    "[{:?}] Left output is not finite: {}",
-                    mode,
-                    out.out_l
-                );
-                assert!(
-                    out.out_r.is_finite(),
-                    "[{:?}] Right output is not finite: {}",
-                    mode,
-                    out.out_r
-                );
-                assert!(
-                    out.out_l >= -SAFETY_CLAMP_LIMIT && out.out_l <= SAFETY_CLAMP_LIMIT,
-                    "[{:?}] Left output {} out of [-4.0, 4.0] safety bounds",
-                    mode,
-                    out.out_l
-                );
-                assert!(
-                    out.out_r >= -SAFETY_CLAMP_LIMIT && out.out_r <= SAFETY_CLAMP_LIMIT,
-                    "[{:?}] Right output {} out of [-4.0, 4.0] safety bounds",
-                    mode,
-                    out.out_r
-                );
-                assert!(
-                    dsp.env_gr_db.is_finite()
-                        && (dsp.env_gr_db == 0.0 || dsp.env_gr_db.is_normal()),
-                    "[{:?}] Internal env_gr_db invalid/subnormal: {}",
-                    mode,
-                    dsp.env_gr_db
-                );
-                assert!(
-                    dsp.auto_slow_gr_db.is_finite()
-                        && (dsp.auto_slow_gr_db == 0.0 || dsp.auto_slow_gr_db.is_normal()),
-                    "[{:?}] Internal auto_slow_gr_db invalid/subnormal: {}",
-                    mode,
-                    dsp.auto_slow_gr_db
-                );
-                for (name, biquad) in [
-                    ("eq_low_cut", &dsp.eq_low_cut),
-                    ("eq_mid_cut", &dsp.eq_mid_cut),
-                    ("eq_high_shelf", &dsp.eq_high_shelf),
-                ] {
+                for (in_l, in_r) in pathological_inputs {
+                    let out = dsp.process_sample(in_l, in_r, &cfg);
                     assert!(
-                        biquad.z1_l.is_finite()
-                            && biquad.z2_l.is_finite()
-                            && biquad.z1_r.is_finite()
-                            && biquad.z2_r.is_finite(),
-                        "[{:?}] Internal EQ biquad states for {} became non-finite",
+                        out.out_l.is_finite(),
+                        "[{:?}] Left output is not finite: {}",
                         mode,
-                        name
+                        out.out_l
                     );
+                    assert!(
+                        out.out_r.is_finite(),
+                        "[{:?}] Right output is not finite: {}",
+                        mode,
+                        out.out_r
+                    );
+                    assert!(
+                        out.out_l >= -SAFETY_CLAMP_LIMIT && out.out_l <= SAFETY_CLAMP_LIMIT,
+                        "[{:?}] Left output {} out of [-4.0, 4.0] safety bounds",
+                        mode,
+                        out.out_l
+                    );
+                    assert!(
+                        out.out_r >= -SAFETY_CLAMP_LIMIT && out.out_r <= SAFETY_CLAMP_LIMIT,
+                        "[{:?}] Right output {} out of [-4.0, 4.0] safety bounds",
+                        mode,
+                        out.out_r
+                    );
+                    assert!(
+                        dsp.env_gr_db.is_finite()
+                            && (dsp.env_gr_db == 0.0 || dsp.env_gr_db.is_normal()),
+                        "[{:?}] Internal env_gr_db invalid/subnormal: {}",
+                        mode,
+                        dsp.env_gr_db
+                    );
+                    assert!(
+                        dsp.auto_slow_gr_db.is_finite()
+                            && (dsp.auto_slow_gr_db == 0.0 || dsp.auto_slow_gr_db.is_normal()),
+                        "[{:?}] Internal auto_slow_gr_db invalid/subnormal: {}",
+                        mode,
+                        dsp.auto_slow_gr_db
+                    );
+                    for (gm_name, gm_val) in [
+                        ("gm_in_ms", dsp.gm_in_ms),
+                        ("gm_post_ms", dsp.gm_post_ms),
+                        ("gm_presence_ms", dsp.gm_presence_ms),
+                        ("gm_gain_db", dsp.gm_gain_db),
+                    ] {
+                        assert!(
+                            gm_val.is_finite() && (gm_val == 0.0 || gm_val.is_normal()),
+                            "[{:?} gm={}] Internal {} invalid/subnormal: {}",
+                            mode,
+                            gain_match,
+                            gm_name,
+                            gm_val
+                        );
+                    }
+                    for (name, biquad) in [
+                        ("eq_low_cut", &dsp.eq_low_cut),
+                        ("eq_mid_cut", &dsp.eq_mid_cut),
+                        ("eq_high_shelf", &dsp.eq_high_shelf),
+                    ] {
+                        assert!(
+                            biquad.z1_l.is_finite()
+                                && biquad.z2_l.is_finite()
+                                && biquad.z1_r.is_finite()
+                                && biquad.z2_r.is_finite(),
+                            "[{:?}] Internal EQ biquad states for {} became non-finite",
+                            mode,
+                            name
+                        );
+                    }
                 }
-            }
 
-            // Long silence tail flushes both envelope stages cleanly to exact 0.0 (no denormals)
-            for _ in 0..(60.0 * sr) as usize {
-                let out = dsp.process_sample(0.0, 0.0, &cfg);
-                assert!(
-                    dsp.env_gr_db == 0.0 || dsp.env_gr_db.is_normal(),
-                    "[{:?}] Subnormal env_gr_db during silence: {}",
-                    mode,
-                    dsp.env_gr_db
+                // Long silence tail flushes both envelope stages cleanly to exact 0.0 (no denormals)
+                for _ in 0..(60.0 * sr) as usize {
+                    let out = dsp.process_sample(0.0, 0.0, &cfg);
+                    assert!(
+                        dsp.env_gr_db == 0.0 || dsp.env_gr_db.is_normal(),
+                        "[{:?}] Subnormal env_gr_db during silence: {}",
+                        mode,
+                        dsp.env_gr_db
+                    );
+                    assert!(
+                        dsp.auto_slow_gr_db == 0.0 || dsp.auto_slow_gr_db.is_normal(),
+                        "[{:?}] Subnormal auto_slow_gr_db during silence: {}",
+                        mode,
+                        dsp.auto_slow_gr_db
+                    );
+                    assert!(
+                        dsp.gm_presence_ms == 0.0 || dsp.gm_presence_ms.is_normal(),
+                        "[{:?}] Subnormal gm_presence_ms during silence: {}",
+                        mode,
+                        dsp.gm_presence_ms
+                    );
+                    assert!(out.out_l.is_finite() && out.out_r.is_finite());
+                }
+                assert_eq!(
+                    dsp.env_gr_db, 0.0,
+                    "[{:?}] env_gr_db failed to flush to 0.0 on silence",
+                    mode
                 );
-                assert!(
-                    dsp.auto_slow_gr_db == 0.0 || dsp.auto_slow_gr_db.is_normal(),
-                    "[{:?}] Subnormal auto_slow_gr_db during silence: {}",
-                    mode,
-                    dsp.auto_slow_gr_db
+                assert_eq!(
+                    dsp.auto_slow_gr_db, 0.0,
+                    "[{:?}] auto_slow_gr_db failed to flush to 0.0 on silence",
+                    mode
                 );
-                assert!(out.out_l.is_finite() && out.out_r.is_finite());
+                assert_eq!(
+                    dsp.gm_presence_ms, 0.0,
+                    "[{:?}] gm_presence_ms failed to flush to 0.0 on silence",
+                    mode
+                );
             }
-            assert_eq!(
-                dsp.env_gr_db, 0.0,
-                "[{:?}] env_gr_db failed to flush to 0.0 on silence",
-                mode
-            );
-            assert_eq!(
-                dsp.auto_slow_gr_db, 0.0,
-                "[{:?}] auto_slow_gr_db failed to flush to 0.0 on silence",
-                mode
-            );
         }
     }
 
@@ -3122,9 +3327,10 @@ mod tests {
             fn set_state(&self, _state: PluginState) {}
         }
 
-        let assert_ui_fits = |label: &str, params: Arc<OmorePunchParams>| {
+        let assert_ui_fits = |label: &str, params: Arc<OmorePunchParams>, gain_match_db: f32| {
             let ctx = egui::Context::default();
             let telemetry = Arc::new(MeterTelemetry::default());
+            store_f32_relaxed(&telemetry.gain_match_db, gain_match_db);
             let dummy_gui = DummyGuiContext;
             let setter = ParamSetter::new(&dummy_gui);
             let raw_input = egui::RawInput {
@@ -3199,7 +3405,7 @@ mod tests {
         };
 
         let manual_params = Arc::new(OmorePunchParams::default());
-        assert_ui_fits("manual_default", manual_params);
+        assert_ui_fits("manual_default", manual_params, 0.0);
 
         let auto_params = OmorePunchParams {
             release_mode: EnumParam::new("Release Mode", ReleaseMode::AutoTight),
@@ -3208,7 +3414,13 @@ mod tests {
         };
         assert_eq!(auto_params.release_mode.value(), ReleaseMode::AutoTight);
         assert_eq!(auto_params.release_ms.value(), 500.0);
-        assert_ui_fits("auto_tight_500ms", Arc::new(auto_params));
+        assert_ui_fits("auto_tight_500ms", Arc::new(auto_params), 0.0);
+
+        let gain_match_params = OmorePunchParams {
+            gain_match: BoolParam::new("Gain Match", true),
+            ..OmorePunchParams::default()
+        };
+        assert_ui_fits("gain_match_on_extreme", Arc::new(gain_match_params), -24.0);
     }
 
     #[test]
@@ -3649,6 +3861,397 @@ mod tests {
                 Vst3SubCategory::Distortion,
                 Vst3SubCategory::Stereo,
             ]
+        );
+    }
+
+    fn measure_gain_match_rms_db(
+        sr: f32,
+        cfg: &DspConfig,
+        freq_hz: f32,
+        amp_l: f32,
+        amp_r: f32,
+        settle_sec: f32,
+        measure_sec: f32,
+    ) -> (f32, f32, f32, f32, f32) {
+        let mut dsp = StereoPunchDsp::new(sr);
+        let settle_samples = (settle_sec * sr).round() as usize;
+        let measure_samples = (measure_sec * sr).round() as usize;
+
+        let mut in_sq_l = 0.0_f64;
+        let mut in_sq_r = 0.0_f64;
+        let mut out_sq_l = 0.0_f64;
+        let mut out_sq_r = 0.0_f64;
+
+        for n in 0..(settle_samples + measure_samples) {
+            let phase = 2.0 * std::f32::consts::PI * freq_hz * (n as f32) / sr;
+            let s = phase.sin();
+            let in_l = amp_l * s;
+            let in_r = amp_r * s;
+            let out = dsp.process_sample(in_l, in_r, cfg);
+            assert!(out.out_l.is_finite() && out.out_r.is_finite());
+
+            if n >= settle_samples {
+                in_sq_l += (in_l as f64) * (in_l as f64);
+                in_sq_r += (in_r as f64) * (in_r as f64);
+                out_sq_l += (out.out_l as f64) * (out.out_l as f64);
+                out_sq_r += (out.out_r as f64) * (out.out_r as f64);
+            }
+        }
+
+        let inv_n = 1.0 / (measure_samples as f64);
+        let in_rms_l = (in_sq_l * inv_n).sqrt() as f32;
+        let in_rms_r = (in_sq_r * inv_n).sqrt() as f32;
+        let out_rms_l = (out_sq_l * inv_n).sqrt() as f32;
+        let out_rms_r = (out_sq_r * inv_n).sqrt() as f32;
+
+        let in_total_rms = (0.5 * (in_sq_l + in_sq_r) * inv_n).sqrt() as f32;
+        let out_total_rms = (0.5 * (out_sq_l + out_sq_r) * inv_n).sqrt() as f32;
+        let diff_db = 20.0 * (out_total_rms / in_total_rms.max(1.0e-12)).log10();
+
+        (diff_db, in_rms_l, in_rms_r, out_rms_l, out_rms_r)
+    }
+
+    #[test]
+    fn test_gain_match_post_processing_convergence_and_stereo_balance() {
+        let scenarios = [
+            (
+                "heavy_comp_no_makeup",
+                DspConfig {
+                    input_db: 0.0,
+                    threshold_db: -24.0,
+                    ratio: 8.0,
+                    auto_makeup: false,
+                    makeup_db: 0.0,
+                    clipper_mode: ClipperMode::Bypass,
+                    gain_match: true,
+                    ..DspConfig::default()
+                },
+                1000.0_f32,
+                0.4_f32,
+                0.4_f32,
+            ),
+            (
+                "eq_auto_makeup_drive_soft_clip",
+                DspConfig {
+                    input_db: 3.0,
+                    threshold_db: -18.0,
+                    ratio: 4.0,
+                    auto_makeup: true,
+                    makeup_db: 6.0,
+                    eq_high_shelf_db: 9.0,
+                    clipper_mode: ClipperMode::SoftClip,
+                    ceiling_db: -3.0,
+                    gain_match: true,
+                    ..DspConfig::default()
+                },
+                8000.0_f32,
+                0.3_f32,
+                0.3_f32,
+            ),
+            (
+                "hard_clip_low_ceiling_post_clipper",
+                DspConfig {
+                    input_db: 6.0,
+                    threshold_db: 0.0,
+                    ratio: 1.0,
+                    auto_makeup: false,
+                    makeup_db: 0.0,
+                    clipper_mode: ClipperMode::HardClip,
+                    ceiling_db: -6.0,
+                    gain_match: true,
+                    ..DspConfig::default()
+                },
+                500.0_f32,
+                0.5_f32,
+                0.5_f32,
+            ),
+            (
+                "eq_500hz_cut",
+                DspConfig {
+                    threshold_db: 0.0,
+                    ratio: 1.0,
+                    auto_makeup: false,
+                    eq_mid_cut_db: -9.0,
+                    clipper_mode: ClipperMode::Bypass,
+                    gain_match: true,
+                    ..DspConfig::default()
+                },
+                500.0_f32,
+                0.35_f32,
+                0.35_f32,
+            ),
+        ];
+
+        for sr in [44100.0_f32, 48000.0_f32, 96000.0_f32] {
+            for (name, cfg, freq_hz, amp_l, amp_r) in &scenarios {
+                let (diff_db, _, _, _, _) =
+                    measure_gain_match_rms_db(sr, cfg, *freq_hz, *amp_l, *amp_r, 2.5, 0.5);
+                assert!(
+                    diff_db.abs() <= 0.5,
+                    "sr={} scenario '{}': RMS mismatch {:.3} dB exceeded 0.5 dB",
+                    sr,
+                    name,
+                    diff_db
+                );
+            }
+        }
+
+        // Stereo balance must remain identical (0.0 dB shift) with asymmetric L/R signal
+        let asym_cfg = DspConfig {
+            threshold_db: -20.0,
+            ratio: 4.0,
+            auto_makeup: true,
+            makeup_db: 3.0,
+            eq_high_shelf_db: 6.0,
+            clipper_mode: ClipperMode::Bypass,
+            gain_match: true,
+            ..DspConfig::default()
+        };
+        let (diff_db, in_l, in_r, out_l, out_r) =
+            measure_gain_match_rms_db(48000.0, &asym_cfg, 1000.0, 0.5, 0.15, 2.5, 0.5);
+        assert!(diff_db.abs() <= 0.5);
+        let in_lr_db = 20.0 * (in_l / in_r).log10();
+        let out_lr_db = 20.0 * (out_l / out_r).log10();
+        assert!(
+            (in_lr_db - out_lr_db).abs() < 1.0e-3,
+            "Gain Match altered L/R stereo balance: in={:.4} dB vs out={:.4} dB",
+            in_lr_db,
+            out_lr_db
+        );
+
+        // Compensation bounds [-24, +24] dB and final safety clamp [-4.0, 4.0]
+        let mut dsp_extreme = StereoPunchDsp::new(48000.0);
+        let extreme_drop_cfg = DspConfig {
+            input_db: -12.0,
+            threshold_db: -40.0,
+            ratio: 20.0,
+            auto_makeup: false,
+            makeup_db: -12.0,
+            clipper_mode: ClipperMode::HardClip,
+            ceiling_db: -6.0,
+            gain_match: true,
+            ..DspConfig::default()
+        };
+        let mut max_observed_trim = 0.0_f32;
+        for n in 0..192000 {
+            let phase = 2.0 * std::f32::consts::PI * 1000.0 * (n as f32) / 48000.0;
+            let s = 0.9 * phase.sin();
+            let out = dsp_extreme.process_sample(s, s, &extreme_drop_cfg);
+            assert!(out.out_l.abs() <= SAFETY_CLAMP_LIMIT);
+            assert!(out.out_r.abs() <= SAFETY_CLAMP_LIMIT);
+            assert!(
+                out.gain_match_db >= GAIN_MATCH_MIN_DB && out.gain_match_db <= GAIN_MATCH_MAX_DB
+            );
+            max_observed_trim = max_observed_trim.max(out.gain_match_db);
+        }
+        assert!(
+            (max_observed_trim - GAIN_MATCH_MAX_DB).abs() < 0.1,
+            "Expected positive trim to saturate cleanly at +24.0 dB, got {:.3} dB",
+            max_observed_trim
+        );
+    }
+
+    #[test]
+    fn test_gain_match_smooth_toggle_and_defaults() {
+        assert!(!DspConfig::default().gain_match);
+        assert!(!OmorePunchParams::default().gain_match.value());
+
+        let sr = 48000.0_f32;
+        let mut dsp = StereoPunchDsp::new(sr);
+        let mut cfg = DspConfig {
+            threshold_db: 0.0,
+            ratio: 1.0,
+            auto_makeup: false,
+            makeup_db: 6.0,
+            clipper_mode: ClipperMode::Bypass,
+            gain_match: false,
+            ..DspConfig::default()
+        };
+
+        // Phase 1: Gain Match OFF -> trim stays strictly 0.0
+        let mut prev_trim_db = 0.0_f32;
+        let mut max_step_db = 0.0_f32;
+        for n in 0..24000 {
+            let phase = 2.0 * std::f32::consts::PI * 1000.0 * (n as f32) / sr;
+            let s = 0.25 * phase.sin();
+            let out = dsp.process_sample(s, s, &cfg);
+            assert_eq!(out.gain_match_db, 0.0);
+        }
+
+        // Phase 2: Toggle ON -> smooth convergence toward -6.0 dB with no abrupt jumps
+        cfg.gain_match = true;
+        for n in 0..72000 {
+            let phase = 2.0 * std::f32::consts::PI * 1000.0 * (n as f32) / sr;
+            let s = 0.25 * phase.sin();
+            let out = dsp.process_sample(s, s, &cfg);
+            max_step_db = max_step_db.max((out.gain_match_db - prev_trim_db).abs());
+            prev_trim_db = out.gain_match_db;
+        }
+        assert!(
+            (prev_trim_db + 6.0).abs() < 0.25,
+            "Expected convergence near -6.0 dB after toggle ON, got {:.3} dB",
+            prev_trim_db
+        );
+
+        // Phase 3: Toggle OFF -> smooth return to exact 0.0 dB
+        cfg.gain_match = false;
+        for n in 0..48000 {
+            let phase = 2.0 * std::f32::consts::PI * 1000.0 * (n as f32) / sr;
+            let s = 0.25 * phase.sin();
+            let out = dsp.process_sample(s, s, &cfg);
+            max_step_db = max_step_db.max((out.gain_match_db - prev_trim_db).abs());
+            prev_trim_db = out.gain_match_db;
+        }
+        assert_eq!(
+            prev_trim_db, 0.0,
+            "Expected exact 0.0 dB once settled after toggle OFF"
+        );
+        assert!(
+            max_step_db < 0.01,
+            "Sample-to-sample trim step ({:.5} dB) too steep during ON/OFF transitions",
+            max_step_db
+        );
+
+        // Verify Gain Match flags out.clipped if final matched output exceeds 0 dBFS (> 1.0)
+        // even with ClipperMode::Bypass
+        let mut dsp_clip = StereoPunchDsp::new(sr);
+        let clip_flag_cfg = DspConfig {
+            input_db: 0.0,
+            threshold_db: 0.0,
+            ratio: 1.0,
+            auto_makeup: false,
+            makeup_db: -12.0,
+            clipper_mode: ClipperMode::Bypass,
+            gain_match: true,
+            ..DspConfig::default()
+        };
+        let mut saw_over_zero_dbfs = false;
+        let mut saw_clipped_flag = false;
+        for n in 0..72000 {
+            let phase = 2.0 * std::f32::consts::PI * 500.0 * (n as f32) / sr;
+            let s = 1.5 * phase.sin();
+            let out = dsp_clip.process_sample(s, s, &clip_flag_cfg);
+            if out.out_l.abs() > 1.0 || out.out_r.abs() > 1.0 {
+                saw_over_zero_dbfs = true;
+                if out.clipped {
+                    saw_clipped_flag = true;
+                }
+            }
+        }
+        assert!(saw_over_zero_dbfs && saw_clipped_flag);
+    }
+
+    #[test]
+    fn test_gain_match_silence_hold_and_transient_preservation() {
+        let sr = 48000.0_f32;
+
+        // 1. Cold-start silence / sub-threshold noise (-70 dBFS) stays strictly at 0.0 dB
+        let mut dsp_cold = StereoPunchDsp::new(sr);
+        let cold_cfg = DspConfig {
+            threshold_db: 0.0,
+            ratio: 1.0,
+            auto_makeup: false,
+            makeup_db: -12.0,
+            clipper_mode: ClipperMode::Bypass,
+            gain_match: true,
+            ..DspConfig::default()
+        };
+        let noise_amp_70dbfs = db_to_lin(-70.0);
+        for n in 0..96000 {
+            let phase = 2.0 * std::f32::consts::PI * 1000.0 * (n as f32) / sr;
+            let s = noise_amp_70dbfs * phase.sin();
+            let out = dsp_cold.process_sample(s, s, &cold_cfg);
+            assert_eq!(
+                out.gain_match_db, 0.0,
+                "Cold-start -70 dBFS noise must not trigger Gain Match boost (sample {})",
+                n
+            );
+        }
+
+        // 2. Mid-stream silence holds last valid trim without drifting toward +24 dB
+        let mut dsp_hold = StereoPunchDsp::new(sr);
+        let active_cfg = DspConfig {
+            threshold_db: 0.0,
+            ratio: 1.0,
+            auto_makeup: false,
+            makeup_db: 8.0,
+            clipper_mode: ClipperMode::Bypass,
+            gain_match: true,
+            ..DspConfig::default()
+        };
+        for n in 0..96000 {
+            let phase = 2.0 * std::f32::consts::PI * 1000.0 * (n as f32) / sr;
+            let s = 0.25 * phase.sin();
+            dsp_hold.process_sample(s, s, &active_cfg);
+        }
+        let converged_trim = dsp_hold.gm_gain_db;
+        assert!(
+            (converged_trim + 8.0).abs() < 0.25,
+            "Expected ~ -8.0 dB trim before break, got {:.3} dB",
+            converged_trim
+        );
+
+        // Feed 3 seconds of -70 dBFS noise / silence: trim must hold near converged_trim
+        for n in 0..144000 {
+            let phase = 2.0 * std::f32::consts::PI * 1000.0 * (n as f32) / sr;
+            let s = if n < 72000 {
+                noise_amp_70dbfs * phase.sin()
+            } else {
+                0.0
+            };
+            let out = dsp_hold.process_sample(s, s, &active_cfg);
+            assert!(
+                (out.gain_match_db - converged_trim).abs() < 0.1,
+                "Hold drifted during silence at sample {}: got {:.3} dB vs {:.3} dB",
+                n,
+                out.gain_match_db,
+                converged_trim
+            );
+        }
+
+        // First active sample on resume uses held trim immediately
+        let resume_out = dsp_hold.process_sample(0.25, 0.25, &active_cfg);
+        assert!((resume_out.gain_match_db - converged_trim).abs() < 0.1);
+
+        // 3. Percussive drum bursts preserve transient punch without rapid pumping
+        let mut dsp_drums = StereoPunchDsp::new(sr);
+        let drum_cfg = DspConfig {
+            threshold_db: -20.0,
+            ratio: 4.0,
+            attack_ms: 5.0,
+            release_ms: 80.0,
+            auto_makeup: false,
+            makeup_db: 0.0,
+            clipper_mode: ClipperMode::SoftClip,
+            ceiling_db: 0.0,
+            gain_match: true,
+            ..DspConfig::default()
+        };
+        let period = (0.4 * sr) as usize;
+        let hit_len = (0.015 * sr) as usize;
+        let mut attack_trim_span = 0.0_f32;
+        for beat in 0..12 {
+            let mut min_hit_trim = f32::INFINITY;
+            let mut max_hit_trim = f32::NEG_INFINITY;
+            for idx in 0..period {
+                let amp = if idx < hit_len { 0.6 } else { 0.025 };
+                let phase =
+                    2.0 * std::f32::consts::PI * 180.0 * ((beat * period + idx) as f32) / sr;
+                let s = amp * phase.sin();
+                let out = dsp_drums.process_sample(s, s, &drum_cfg);
+                if beat >= 8 && idx < hit_len {
+                    min_hit_trim = min_hit_trim.min(out.gain_match_db);
+                    max_hit_trim = max_hit_trim.max(out.gain_match_db);
+                }
+            }
+            if beat >= 8 {
+                attack_trim_span = attack_trim_span.max(max_hit_trim - min_hit_trim);
+            }
+        }
+        assert!(
+            attack_trim_span < 0.25,
+            "Gain Match modulated too rapidly across 15 ms drum hit ({:.3} dB)",
+            attack_trim_span
         );
     }
 }
