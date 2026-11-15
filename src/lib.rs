@@ -894,6 +894,24 @@ impl MeterTelemetry {
         store_f32_relaxed(&self.max_gr_db, 0.0);
         self.clip_latched.store(false, Ordering::Relaxed);
     }
+
+    /// Returns the instantaneous gain adjustment in dB for DAW host metering
+    /// (`0.0` when idle or non-finite, negative down to `-MAX_GR_METER_DB` when compressing).
+    #[inline(always)]
+    pub fn host_gain_reduction_db(&self) -> f64 {
+        let raw = load_f32_relaxed(&self.current_gr_db);
+        if !raw.is_finite() || raw <= 0.0 {
+            0.0
+        } else {
+            -(raw.min(MAX_GR_METER_DB) as f64)
+        }
+    }
+
+    /// Clears the instantaneous gain reduction telemetry back to `0.0`.
+    #[inline(always)]
+    pub fn clear_gain_reduction(&self) {
+        store_f32_relaxed(&self.current_gr_db, 0.0);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -949,11 +967,6 @@ pub struct OmorePunchParams {
 
     #[id = "gain_match"]
     pub gain_match: BoolParam,
-
-    /// Readout parameter exposed to Reaper TCP/MCP so the user can also embed
-    /// or monitor Gain Reduction (dB) as a track control / automation lane.
-    #[id = "gr_meter_db"]
-    pub gr_meter_db: FloatParam,
 }
 
 /// Builds the `Release` parameter with a configurable default so tests can exercise wide readouts.
@@ -1120,18 +1133,6 @@ impl Default for OmorePunchParams {
             .with_value_to_string(formatters::v2s_f32_rounded(1)),
 
             gain_match: BoolParam::new("Gain Match", false),
-
-            gr_meter_db: FloatParam::new(
-                "Gain Reduction (dB)",
-                0.0,
-                FloatRange::Linear {
-                    min: -MAX_GR_METER_DB,
-                    max: 0.0,
-                },
-            )
-            .with_unit(" dB")
-            .with_value_to_string(formatters::v2s_f32_rounded(2))
-            .non_automatable(),
         }
     }
 }
@@ -1139,6 +1140,15 @@ impl Default for OmorePunchParams {
 // ----------------------------------------------------------------------------
 // Main Plugin Struct
 // ----------------------------------------------------------------------------
+
+thread_local! {
+    static LAST_CREATED_TELEMETRY: std::cell::RefCell<Option<Arc<MeterTelemetry>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn take_last_created_telemetry() -> Option<Arc<MeterTelemetry>> {
+    LAST_CREATED_TELEMETRY.with(|slot| slot.borrow_mut().take())
+}
 
 pub struct OmorePunch {
     params: Arc<OmorePunchParams>,
@@ -1149,11 +1159,15 @@ pub struct OmorePunch {
 
 impl Default for OmorePunch {
     fn default() -> Self {
+        let telemetry = Arc::new(MeterTelemetry::default());
+        LAST_CREATED_TELEMETRY.with(|slot| {
+            *slot.borrow_mut() = Some(telemetry.clone());
+        });
         Self {
             params: Arc::new(OmorePunchParams::default()),
             editor_state: EguiState::from_size(UI_WINDOW_WIDTH, UI_WINDOW_HEIGHT),
             dsp: StereoPunchDsp::default(),
-            telemetry: Arc::new(MeterTelemetry::default()),
+            telemetry,
         }
     }
 }
@@ -1163,7 +1177,7 @@ impl OmorePunch {
     /// e.g. -4.8) for CLAP `clap.gain-adjustment-metering/0` and VST3 `IGainReductionInfo`.
     #[inline(always)]
     pub fn current_gain_adjustment_db(&self) -> f64 {
-        -(load_f32_relaxed(&self.telemetry.current_gr_db) as f64)
+        self.telemetry.host_gain_reduction_db()
     }
 }
 
@@ -1201,12 +1215,14 @@ impl Plugin for OmorePunch {
     ) -> bool {
         self.dsp.set_sample_rate(buffer_config.sample_rate);
         self.dsp.reset();
+        self.telemetry.clear_gain_reduction();
         self.telemetry.reset_peaks();
         true
     }
 
     fn reset(&mut self) {
         self.dsp.reset();
+        self.telemetry.clear_gain_reduction();
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
@@ -1885,12 +1901,6 @@ fn draw_omore_punch_ui(
             gain_match_db_raw
         };
 
-    // Keep Reaper's readable GR parameter synchronized while UI is open
-    let target_gr_param = (-current_gr_db).clamp(-MAX_GR_METER_DB, 0.0);
-    if (params.gr_meter_db.value() - target_gr_param).abs() > 0.05 {
-        setter.set_parameter(&params.gr_meter_db, target_gr_param);
-    }
-
     draw_header_bar(
         egui_ctx,
         telemetry,
@@ -2420,8 +2430,747 @@ impl Vst3Plugin for OmorePunch {
     ];
 }
 
-nih_export_clap!(OmorePunch);
-nih_export_vst3!(OmorePunch);
+mod clap {
+    use super::{take_last_created_telemetry, MeterTelemetry, OmorePunch};
+    use nih_plug::wrapper::clap::{
+        clap_host, clap_plugin, clap_plugin_descriptor, clap_plugin_entry, clap_plugin_factory,
+        PluginDescriptor, Wrapper as ClapWrapper, CLAP_PLUGIN_FACTORY_ID, CLAP_VERSION,
+    };
+    use nih_plug::wrapper::setup_logger;
+    use std::ffi::{c_char, c_void, CStr};
+    use std::sync::{Arc, OnceLock};
+
+    const CLAP_EXT_GAIN_ADJUSTMENT_METERING: &[u8] = b"clap.gain-adjustment-metering/0\0";
+
+    #[repr(C)]
+    pub struct ClapPluginGainAdjustmentMetering {
+        pub get: Option<unsafe extern "C" fn(plugin: *const clap_plugin) -> f64>,
+    }
+
+    static CLAP_GAIN_ADJUSTMENT_METERING: ClapPluginGainAdjustmentMetering =
+        ClapPluginGainAdjustmentMetering {
+            get: Some(clap_gain_adjustment_get),
+        };
+
+    #[repr(C)]
+    struct ClapGainReductionBox {
+        // Must remain the first field so `*const clap_plugin` casts cleanly to `*mut Self`.
+        plugin: clap_plugin,
+        inner_destroy: Option<unsafe extern "C" fn(plugin: *const clap_plugin)>,
+        inner_deactivate: Option<unsafe extern "C" fn(plugin: *const clap_plugin)>,
+        inner_stop_processing: Option<unsafe extern "C" fn(plugin: *const clap_plugin)>,
+        inner_reset: Option<unsafe extern "C" fn(plugin: *const clap_plugin)>,
+        inner_get_extension: Option<
+            unsafe extern "C" fn(plugin: *const clap_plugin, id: *const c_char) -> *const c_void,
+        >,
+        telemetry: Arc<MeterTelemetry>,
+    }
+
+    fn plugin_descriptor() -> &'static PluginDescriptor {
+        static DESCRIPTOR: OnceLock<PluginDescriptor> = OnceLock::new();
+        DESCRIPTOR.get_or_init(PluginDescriptor::for_plugin::<OmorePunch>)
+    }
+
+    unsafe extern "C" fn clap_gain_adjustment_get(plugin: *const clap_plugin) -> f64 {
+        if plugin.is_null() {
+            return 0.0;
+        }
+        let boxed = &*(plugin as *const ClapGainReductionBox);
+        boxed.telemetry.host_gain_reduction_db()
+    }
+
+    unsafe extern "C" fn clap_destroy(plugin: *const clap_plugin) {
+        if plugin.is_null() {
+            return;
+        }
+        let boxed = Box::from_raw(plugin as *mut ClapGainReductionBox);
+        if let Some(destroy) = boxed.inner_destroy {
+            destroy(&boxed.plugin);
+        }
+    }
+
+    unsafe extern "C" fn clap_deactivate(plugin: *const clap_plugin) {
+        if plugin.is_null() {
+            return;
+        }
+        let boxed = &*(plugin as *const ClapGainReductionBox);
+        boxed.telemetry.clear_gain_reduction();
+        if let Some(deactivate) = boxed.inner_deactivate {
+            deactivate(plugin);
+        }
+    }
+
+    unsafe extern "C" fn clap_stop_processing(plugin: *const clap_plugin) {
+        if plugin.is_null() {
+            return;
+        }
+        let boxed = &*(plugin as *const ClapGainReductionBox);
+        boxed.telemetry.clear_gain_reduction();
+        if let Some(stop_processing) = boxed.inner_stop_processing {
+            stop_processing(plugin);
+        }
+    }
+
+    unsafe extern "C" fn clap_reset(plugin: *const clap_plugin) {
+        if plugin.is_null() {
+            return;
+        }
+        let boxed = &*(plugin as *const ClapGainReductionBox);
+        boxed.telemetry.clear_gain_reduction();
+        if let Some(reset) = boxed.inner_reset {
+            reset(plugin);
+        }
+    }
+
+    unsafe extern "C" fn clap_get_extension(
+        plugin: *const clap_plugin,
+        id: *const c_char,
+    ) -> *const c_void {
+        if plugin.is_null() || id.is_null() {
+            return std::ptr::null();
+        }
+
+        let ext_id =
+            CStr::from_bytes_with_nul_unchecked(CLAP_EXT_GAIN_ADJUSTMENT_METERING);
+        if CStr::from_ptr(id) == ext_id {
+            return &CLAP_GAIN_ADJUSTMENT_METERING as *const ClapPluginGainAdjustmentMetering
+                as *const c_void;
+        }
+
+        let boxed = &*(plugin as *const ClapGainReductionBox);
+        if let Some(get_extension) = boxed.inner_get_extension {
+            get_extension(plugin, id)
+        } else {
+            std::ptr::null()
+        }
+    }
+
+    unsafe extern "C" fn clap_get_plugin_count(_factory: *const clap_plugin_factory) -> u32 {
+        1
+    }
+
+    unsafe extern "C" fn clap_get_plugin_descriptor(
+        _factory: *const clap_plugin_factory,
+        index: u32,
+    ) -> *const clap_plugin_descriptor {
+        if index == 0 {
+            plugin_descriptor().clap_plugin_descriptor()
+        } else {
+            std::ptr::null()
+        }
+    }
+
+    unsafe extern "C" fn clap_create_plugin(
+        _factory: *const clap_plugin_factory,
+        host: *const clap_host,
+        plugin_id: *const c_char,
+    ) -> *const clap_plugin {
+        if host.is_null() || plugin_id.is_null() {
+            return std::ptr::null();
+        }
+
+        if CStr::from_ptr(plugin_id) != plugin_descriptor().clap_id() {
+            return std::ptr::null();
+        }
+
+        // Clear any leftover entry on this thread before instantiating OmorePunch.
+        let _ = take_last_created_telemetry();
+        let wrapper = ClapWrapper::<OmorePunch>::new(host);
+        let telemetry = take_last_created_telemetry().unwrap_or_default();
+
+        let inner_ptr = wrapper.clap_plugin.as_ptr();
+        let inner = &*inner_ptr;
+
+        let boxed = Box::new(ClapGainReductionBox {
+            plugin: clap_plugin {
+                desc: inner.desc,
+                plugin_data: inner.plugin_data,
+                init: inner.init,
+                destroy: Some(clap_destroy),
+                activate: inner.activate,
+                deactivate: Some(clap_deactivate),
+                start_processing: inner.start_processing,
+                stop_processing: Some(clap_stop_processing),
+                reset: Some(clap_reset),
+                process: inner.process,
+                get_extension: Some(clap_get_extension),
+                on_main_thread: inner.on_main_thread,
+            },
+            inner_destroy: inner.destroy,
+            inner_deactivate: inner.deactivate,
+            inner_stop_processing: inner.stop_processing,
+            inner_reset: inner.reset,
+            inner_get_extension: inner.get_extension,
+            telemetry,
+        });
+
+        // Wrapper ownership transfers into `plugin.plugin_data` and is freed inside
+        // `inner_destroy` when `clap_destroy` runs.
+        std::mem::forget(wrapper);
+
+        &(*Box::into_raw(boxed)).plugin
+    }
+
+    static CLAP_FACTORY: clap_plugin_factory = clap_plugin_factory {
+        get_plugin_count: Some(clap_get_plugin_count),
+        get_plugin_descriptor: Some(clap_get_plugin_descriptor),
+        create_plugin: Some(clap_create_plugin),
+    };
+
+    unsafe extern "C" fn clap_init(_plugin_path: *const c_char) -> bool {
+        setup_logger();
+        true
+    }
+
+    unsafe extern "C" fn clap_deinit() {}
+
+    unsafe extern "C" fn clap_get_factory(factory_id: *const c_char) -> *const c_void {
+        if factory_id.is_null() {
+            return std::ptr::null();
+        }
+        if CStr::from_ptr(factory_id) == CLAP_PLUGIN_FACTORY_ID {
+            &CLAP_FACTORY as *const clap_plugin_factory as *const c_void
+        } else {
+            std::ptr::null()
+        }
+    }
+
+    #[no_mangle]
+    #[used]
+    pub static clap_entry: clap_plugin_entry = clap_plugin_entry {
+        clap_version: CLAP_VERSION,
+        init: Some(clap_init),
+        deinit: Some(clap_deinit),
+        get_factory: Some(clap_get_factory),
+    };
+}
+
+mod vst3 {
+    #![allow(non_snake_case)]
+
+    use super::{take_last_created_telemetry, MeterTelemetry, OmorePunch};
+    use nih_plug::wrapper::setup_logger;
+    use nih_plug::wrapper::vst3::{vst3_sys, PluginInfo, Wrapper as Vst3Wrapper};
+    use std::ffi::c_void;
+    use std::sync::{Arc, OnceLock};
+    use vst3_sys as vst3_com;
+    use vst3_sys::base::{
+        kInvalidArgument, kNoInterface, kResultOk, tresult, FIDString, IBStream, IPluginBase,
+        IPluginFactory, IPluginFactory2, IPluginFactory3, IUnknown, PClassInfo, PClassInfo2,
+        PClassInfoW, PFactoryInfo, TBool,
+    };
+    use vst3_sys::utils::SharedVstPtr;
+    use vst3_sys::vst::{
+        BusDirection, BusInfo, CtrlNumber, IAudioProcessor, IComponent, IComponentHandler,
+        IEditController, IMidiMapping, INoteExpressionController, IProcessContextRequirements,
+        IUnitInfo, IoMode, MediaType, NoteExpressionTypeInfo, ParamID, ParameterInfo,
+        ProcessData, ProcessSetup, ProgramListInfo, RoutingInfo, SpeakerArrangement, TChar,
+        UnitInfo,
+    };
+    use vst3_sys::{com_interface, IID, VST3};
+
+    #[com_interface("8E3C292C-9592-4F9D-B259-0B1E100E4198")]
+    pub trait IGainReductionInfo: IUnknown {
+        unsafe fn get_gain_reduction_value_in_db(&self) -> f64;
+    }
+
+    #[VST3(implements(
+        IComponent,
+        IEditController,
+        IAudioProcessor,
+        IMidiMapping,
+        INoteExpressionController,
+        IProcessContextRequirements,
+        IUnitInfo,
+        IGainReductionInfo
+    ))]
+    struct Vst3GainReductionProxy {
+        inner: *mut Vst3Wrapper<OmorePunch>,
+        telemetry: Arc<MeterTelemetry>,
+    }
+
+    unsafe impl Send for Vst3GainReductionProxy {}
+    unsafe impl Sync for Vst3GainReductionProxy {}
+
+    impl Drop for Vst3GainReductionProxy {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.inner.is_null() {
+                    (*self.inner).release();
+                    self.inner = std::ptr::null_mut();
+                }
+            }
+        }
+    }
+
+    impl IPluginBase for Vst3GainReductionProxy {
+        unsafe fn initialize(&self, context: *mut c_void) -> tresult {
+            (*self.inner).initialize(context)
+        }
+
+        unsafe fn terminate(&self) -> tresult {
+            self.telemetry.clear_gain_reduction();
+            (*self.inner).terminate()
+        }
+    }
+
+    impl IComponent for Vst3GainReductionProxy {
+        unsafe fn get_controller_class_id(&self, tuid: *mut IID) -> tresult {
+            (*self.inner).get_controller_class_id(tuid)
+        }
+
+        unsafe fn set_io_mode(&self, mode: IoMode) -> tresult {
+            (*self.inner).set_io_mode(mode)
+        }
+
+        unsafe fn get_bus_count(&self, type_: MediaType, dir: BusDirection) -> i32 {
+            (*self.inner).get_bus_count(type_, dir)
+        }
+
+        unsafe fn get_bus_info(
+            &self,
+            type_: MediaType,
+            dir: BusDirection,
+            index: i32,
+            info: *mut BusInfo,
+        ) -> tresult {
+            (*self.inner).get_bus_info(type_, dir, index, info)
+        }
+
+        unsafe fn get_routing_info(
+            &self,
+            in_info: *mut RoutingInfo,
+            out_info: *mut RoutingInfo,
+        ) -> tresult {
+            (*self.inner).get_routing_info(in_info, out_info)
+        }
+
+        unsafe fn activate_bus(
+            &self,
+            type_: MediaType,
+            dir: BusDirection,
+            index: i32,
+            state: TBool,
+        ) -> tresult {
+            (*self.inner).activate_bus(type_, dir, index, state)
+        }
+
+        unsafe fn set_active(&self, state: TBool) -> tresult {
+            if state == 0 {
+                self.telemetry.clear_gain_reduction();
+            }
+            (*self.inner).set_active(state)
+        }
+
+        unsafe fn set_state(&self, state: SharedVstPtr<dyn IBStream>) -> tresult {
+            <Vst3Wrapper<OmorePunch> as IComponent>::set_state(&*self.inner, state)
+        }
+
+        unsafe fn get_state(&self, state: SharedVstPtr<dyn IBStream>) -> tresult {
+            <Vst3Wrapper<OmorePunch> as IComponent>::get_state(&*self.inner, state)
+        }
+    }
+
+    impl IEditController for Vst3GainReductionProxy {
+        unsafe fn set_component_state(&self, state: SharedVstPtr<dyn IBStream>) -> tresult {
+            (*self.inner).set_component_state(state)
+        }
+
+        unsafe fn set_state(&self, state: SharedVstPtr<dyn IBStream>) -> tresult {
+            <Vst3Wrapper<OmorePunch> as IEditController>::set_state(&*self.inner, state)
+        }
+
+        unsafe fn get_state(&self, state: SharedVstPtr<dyn IBStream>) -> tresult {
+            <Vst3Wrapper<OmorePunch> as IEditController>::get_state(&*self.inner, state)
+        }
+
+        unsafe fn get_parameter_count(&self) -> i32 {
+            (*self.inner).get_parameter_count()
+        }
+
+        unsafe fn get_parameter_info(
+            &self,
+            param_index: i32,
+            info: *mut ParameterInfo,
+        ) -> tresult {
+            (*self.inner).get_parameter_info(param_index, info)
+        }
+
+        unsafe fn get_param_string_by_value(
+            &self,
+            id: u32,
+            value_normalized: f64,
+            string: *mut TChar,
+        ) -> tresult {
+            (*self.inner).get_param_string_by_value(id, value_normalized, string)
+        }
+
+        unsafe fn get_param_value_by_string(
+            &self,
+            id: u32,
+            string: *const TChar,
+            value_normalized: *mut f64,
+        ) -> tresult {
+            (*self.inner).get_param_value_by_string(id, string, value_normalized)
+        }
+
+        unsafe fn normalized_param_to_plain(&self, id: u32, value_normalized: f64) -> f64 {
+            (*self.inner).normalized_param_to_plain(id, value_normalized)
+        }
+
+        unsafe fn plain_param_to_normalized(&self, id: u32, plain_value: f64) -> f64 {
+            (*self.inner).plain_param_to_normalized(id, plain_value)
+        }
+
+        unsafe fn get_param_normalized(&self, id: u32) -> f64 {
+            (*self.inner).get_param_normalized(id)
+        }
+
+        unsafe fn set_param_normalized(&self, id: u32, value: f64) -> tresult {
+            (*self.inner).set_param_normalized(id, value)
+        }
+
+        unsafe fn set_component_handler(
+            &self,
+            handler: SharedVstPtr<dyn IComponentHandler>,
+        ) -> tresult {
+            (*self.inner).set_component_handler(handler)
+        }
+
+        unsafe fn create_view(&self, name: FIDString) -> *mut c_void {
+            (*self.inner).create_view(name)
+        }
+    }
+
+    impl IAudioProcessor for Vst3GainReductionProxy {
+        unsafe fn set_bus_arrangements(
+            &self,
+            inputs: *mut SpeakerArrangement,
+            num_ins: i32,
+            outputs: *mut SpeakerArrangement,
+            num_outs: i32,
+        ) -> tresult {
+            (*self.inner).set_bus_arrangements(inputs, num_ins, outputs, num_outs)
+        }
+
+        unsafe fn get_bus_arrangement(
+            &self,
+            dir: BusDirection,
+            index: i32,
+            arr: *mut SpeakerArrangement,
+        ) -> tresult {
+            (*self.inner).get_bus_arrangement(dir, index, arr)
+        }
+
+        unsafe fn can_process_sample_size(&self, symbolic_sample_size: i32) -> tresult {
+            (*self.inner).can_process_sample_size(symbolic_sample_size)
+        }
+
+        unsafe fn get_latency_samples(&self) -> u32 {
+            (*self.inner).get_latency_samples()
+        }
+
+        unsafe fn setup_processing(&self, setup: *const ProcessSetup) -> tresult {
+            (*self.inner).setup_processing(setup)
+        }
+
+        unsafe fn set_processing(&self, state: TBool) -> tresult {
+            if state == 0 {
+                self.telemetry.clear_gain_reduction();
+            }
+            (*self.inner).set_processing(state)
+        }
+
+        unsafe fn process(&self, data: *mut ProcessData) -> tresult {
+            (*self.inner).process(data)
+        }
+
+        unsafe fn get_tail_samples(&self) -> u32 {
+            (*self.inner).get_tail_samples()
+        }
+    }
+
+    impl IMidiMapping for Vst3GainReductionProxy {
+        unsafe fn get_midi_controller_assignment(
+            &self,
+            bus_index: i32,
+            channel: i16,
+            midi_cc_number: CtrlNumber,
+            param_id: *mut ParamID,
+        ) -> tresult {
+            (*self.inner).get_midi_controller_assignment(bus_index, channel, midi_cc_number, param_id)
+        }
+    }
+
+    impl INoteExpressionController for Vst3GainReductionProxy {
+        unsafe fn get_note_expression_count(&self, bus_idx: i32, channel: i16) -> i32 {
+            (*self.inner).get_note_expression_count(bus_idx, channel)
+        }
+
+        unsafe fn get_note_expression_info(
+            &self,
+            bus_idx: i32,
+            channel: i16,
+            note_expression_idx: i32,
+            info: *mut NoteExpressionTypeInfo,
+        ) -> tresult {
+            (*self.inner).get_note_expression_info(bus_idx, channel, note_expression_idx, info)
+        }
+
+        unsafe fn get_note_expression_string_by_value(
+            &self,
+            bus_idx: i32,
+            channel: i16,
+            id: u32,
+            value: f64,
+            string: *mut TChar,
+        ) -> tresult {
+            (*self.inner).get_note_expression_string_by_value(bus_idx, channel, id, value, string)
+        }
+
+        unsafe fn get_note_expression_value_by_string(
+            &self,
+            bus_idx: i32,
+            channel: i16,
+            id: u32,
+            string: *const TChar,
+            value: *mut f64,
+        ) -> tresult {
+            (*self.inner).get_note_expression_value_by_string(bus_idx, channel, id, string, value)
+        }
+    }
+
+    impl IProcessContextRequirements for Vst3GainReductionProxy {
+        unsafe fn get_process_context_requirements(&self) -> u32 {
+            (*self.inner).get_process_context_requirements()
+        }
+    }
+
+    impl IUnitInfo for Vst3GainReductionProxy {
+        unsafe fn get_unit_count(&self) -> i32 {
+            (*self.inner).get_unit_count()
+        }
+
+        unsafe fn get_unit_info(&self, unit_index: i32, info: *mut UnitInfo) -> tresult {
+            (*self.inner).get_unit_info(unit_index, info)
+        }
+
+        unsafe fn get_program_list_count(&self) -> i32 {
+            (*self.inner).get_program_list_count()
+        }
+
+        unsafe fn get_program_list_info(
+            &self,
+            list_index: i32,
+            info: *mut ProgramListInfo,
+        ) -> tresult {
+            (*self.inner).get_program_list_info(list_index, info)
+        }
+
+        unsafe fn get_program_name(
+            &self,
+            list_id: i32,
+            program_index: i32,
+            name: *mut u16,
+        ) -> tresult {
+            (*self.inner).get_program_name(list_id, program_index, name)
+        }
+
+        unsafe fn get_program_info(
+            &self,
+            list_id: i32,
+            program_index: i32,
+            attribute_id: *const u8,
+            attribute_value: *mut u16,
+        ) -> tresult {
+            (*self.inner).get_program_info(list_id, program_index, attribute_id, attribute_value)
+        }
+
+        unsafe fn has_program_pitch_names(&self, id: i32, index: i32) -> tresult {
+            (*self.inner).has_program_pitch_names(id, index)
+        }
+
+        unsafe fn get_program_pitch_name(
+            &self,
+            id: i32,
+            index: i32,
+            pitch: i16,
+            name: *mut u16,
+        ) -> tresult {
+            (*self.inner).get_program_pitch_name(id, index, pitch, name)
+        }
+
+        unsafe fn get_selected_unit(&self) -> i32 {
+            (*self.inner).get_selected_unit()
+        }
+
+        unsafe fn select_unit(&self, id: i32) -> tresult {
+            (*self.inner).select_unit(id)
+        }
+
+        unsafe fn get_unit_by_bus(
+            &self,
+            type_: i32,
+            dir: i32,
+            bus_index: i32,
+            channel: i32,
+            unit_id: *mut i32,
+        ) -> tresult {
+            (*self.inner).get_unit_by_bus(type_, dir, bus_index, channel, unit_id)
+        }
+
+        unsafe fn set_unit_program_data(
+            &self,
+            list_or_unit: i32,
+            program_idx: i32,
+            data: SharedVstPtr<dyn IBStream>,
+        ) -> tresult {
+            (*self.inner).set_unit_program_data(list_or_unit, program_idx, data)
+        }
+    }
+
+    impl IGainReductionInfo for Vst3GainReductionProxy {
+        unsafe fn get_gain_reduction_value_in_db(&self) -> f64 {
+            self.telemetry.host_gain_reduction_db()
+        }
+    }
+
+    fn plugin_info() -> &'static PluginInfo {
+        static INFO: OnceLock<PluginInfo> = OnceLock::new();
+        INFO.get_or_init(PluginInfo::for_plugin::<OmorePunch>)
+    }
+
+    #[VST3(implements(IPluginFactory3))]
+    struct Factory {
+        info: &'static PluginInfo,
+    }
+
+    impl IPluginFactory for Factory {
+        unsafe fn get_factory_info(&self, info: *mut PFactoryInfo) -> tresult {
+            if info.is_null() {
+                return kInvalidArgument;
+            }
+            *info = self.info.create_factory_info();
+            kResultOk
+        }
+
+        unsafe fn count_classes(&self) -> i32 {
+            1
+        }
+
+        unsafe fn get_class_info(&self, index: i32, info: *mut PClassInfo) -> tresult {
+            if index != 0 || info.is_null() {
+                return kInvalidArgument;
+            }
+            *info = self.info.create_class_info();
+            kResultOk
+        }
+
+        unsafe fn create_instance(
+            &self,
+            cid: *const IID,
+            iid: *const IID,
+            obj: *mut *mut c_void,
+        ) -> tresult {
+            if obj.is_null() {
+                return kInvalidArgument;
+            }
+            *obj = std::ptr::null_mut();
+
+            if cid.is_null() || iid.is_null() {
+                return kInvalidArgument;
+            }
+            if (*cid).data != *self.info.cid {
+                return kNoInterface;
+            }
+
+            // Clear any unused entry on this thread before instantiating OmorePunch.
+            let _ = take_last_created_telemetry();
+            let inner = Box::into_raw(Vst3Wrapper::<OmorePunch>::new());
+            let telemetry = take_last_created_telemetry().unwrap_or_default();
+
+            let proxy = Vst3GainReductionProxy::allocate(inner, telemetry);
+            let result = proxy.query_interface(&*iid, obj);
+            if result == kResultOk {
+                proxy.release();
+                std::mem::forget(proxy);
+                kResultOk
+            } else {
+                drop(proxy);
+                *obj = std::ptr::null_mut();
+                result
+            }
+        }
+    }
+
+    impl IPluginFactory2 for Factory {
+        unsafe fn get_class_info2(&self, index: i32, info: *mut PClassInfo2) -> tresult {
+            if index != 0 || info.is_null() {
+                return kInvalidArgument;
+            }
+            *info = self.info.create_class_info_2();
+            kResultOk
+        }
+    }
+
+    impl IPluginFactory3 for Factory {
+        unsafe fn get_class_info_unicode(&self, index: i32, info: *mut PClassInfoW) -> tresult {
+            if index != 0 || info.is_null() {
+                return kInvalidArgument;
+            }
+            *info = self.info.create_class_info_unicode();
+            kResultOk
+        }
+
+        unsafe fn set_host_context(&self, _context: *mut c_void) -> tresult {
+            kResultOk
+        }
+    }
+
+    #[no_mangle]
+    pub extern "system" fn GetPluginFactory() -> *mut c_void {
+        Box::into_raw(Factory::allocate(plugin_info())) as *mut c_void
+    }
+
+    #[cfg(all(target_family = "unix", not(target_os = "macos")))]
+    #[no_mangle]
+    pub extern "C" fn ModuleEntry(_lib_handle: *mut c_void) -> bool {
+        setup_logger();
+        true
+    }
+
+    #[cfg(all(target_family = "unix", not(target_os = "macos")))]
+    #[no_mangle]
+    pub extern "C" fn ModuleExit() -> bool {
+        true
+    }
+
+    #[cfg(target_os = "macos")]
+    #[no_mangle]
+    pub extern "C" fn bundleEntry(_bundle_ref: *mut c_void) -> bool {
+        setup_logger();
+        true
+    }
+
+    #[cfg(target_os = "macos")]
+    #[no_mangle]
+    pub extern "C" fn bundleExit() -> bool {
+        true
+    }
+
+    #[cfg(target_os = "windows")]
+    #[no_mangle]
+    pub extern "system" fn InitDll() -> bool {
+        setup_logger();
+        true
+    }
+
+    #[cfg(target_os = "windows")]
+    #[no_mangle]
+    pub extern "system" fn ExitDll() -> bool {
+        true
+    }
+}
 
 // ============================================================================
 // UNIT TESTS (cargo test)
@@ -4253,5 +5002,882 @@ mod tests {
             "Gain Match modulated too rapidly across 15 ms drum hit ({:.3} dB)",
             attack_trim_span
         );
+    }
+
+    #[repr(C)]
+    struct TestClapAudioBuffer {
+        data32: *mut *mut f32,
+        data64: *mut *mut f64,
+        channel_count: u32,
+        latency: u32,
+        constant_mask: u64,
+    }
+
+    #[repr(C)]
+    struct TestClapInputEvents {
+        ctx: *mut std::ffi::c_void,
+        size: Option<unsafe extern "C" fn(list: *const TestClapInputEvents) -> u32>,
+        get: Option<
+            unsafe extern "C" fn(
+                list: *const TestClapInputEvents,
+                index: u32,
+            ) -> *const std::ffi::c_void,
+        >,
+    }
+
+    #[repr(C)]
+    struct TestClapOutputEvents {
+        ctx: *mut std::ffi::c_void,
+        try_push: Option<
+            unsafe extern "C" fn(
+                list: *const TestClapOutputEvents,
+                event: *const std::ffi::c_void,
+            ) -> bool,
+        >,
+    }
+
+    #[repr(C)]
+    struct TestClapProcess {
+        steady_time: i64,
+        frames_count: u32,
+        transport: *const std::ffi::c_void,
+        audio_inputs: *const TestClapAudioBuffer,
+        audio_outputs: *mut TestClapAudioBuffer,
+        audio_inputs_count: u32,
+        audio_outputs_count: u32,
+        in_events: *const TestClapInputEvents,
+        out_events: *const TestClapOutputEvents,
+    }
+
+    #[repr(C)]
+    struct TestClapParamInfo {
+        id: u32,
+        flags: u32,
+        cookie: *mut std::ffi::c_void,
+        name: [std::ffi::c_char; 256],
+        module: [std::ffi::c_char; 1024],
+        min_value: f64,
+        max_value: f64,
+        default_value: f64,
+    }
+
+    #[repr(C)]
+    struct TestClapPluginParams {
+        count: Option<
+            unsafe extern "C" fn(plugin: *const nih_plug::wrapper::clap::clap_plugin) -> u32,
+        >,
+        get_info: Option<
+            unsafe extern "C" fn(
+                plugin: *const nih_plug::wrapper::clap::clap_plugin,
+                param_index: u32,
+                param_info: *mut TestClapParamInfo,
+            ) -> bool,
+        >,
+        get_value: Option<
+            unsafe extern "C" fn(
+                plugin: *const nih_plug::wrapper::clap::clap_plugin,
+                param_id: u32,
+                out_value: *mut f64,
+            ) -> bool,
+        >,
+        value_to_text: Option<
+            unsafe extern "C" fn(
+                plugin: *const nih_plug::wrapper::clap::clap_plugin,
+                param_id: u32,
+                value: f64,
+                out_buffer: *mut std::ffi::c_char,
+                out_buffer_capacity: u32,
+            ) -> bool,
+        >,
+        text_to_value: Option<
+            unsafe extern "C" fn(
+                plugin: *const nih_plug::wrapper::clap::clap_plugin,
+                param_id: u32,
+                param_value_text: *const std::ffi::c_char,
+                out_value: *mut f64,
+            ) -> bool,
+        >,
+        flush: Option<
+            unsafe extern "C" fn(
+                plugin: *const nih_plug::wrapper::clap::clap_plugin,
+                in_: *const TestClapInputEvents,
+                out: *const TestClapOutputEvents,
+            ),
+        >,
+    }
+
+    unsafe extern "C" fn test_clap_host_get_extension(
+        _host: *const nih_plug::wrapper::clap::clap_host,
+        _extension_id: *const std::ffi::c_char,
+    ) -> *const std::ffi::c_void {
+        std::ptr::null()
+    }
+
+    unsafe extern "C" fn test_clap_host_noop(_host: *const nih_plug::wrapper::clap::clap_host) {}
+
+    unsafe extern "C" fn test_clap_in_events_size(_list: *const TestClapInputEvents) -> u32 {
+        0
+    }
+
+    unsafe extern "C" fn test_clap_in_events_get(
+        _list: *const TestClapInputEvents,
+        _index: u32,
+    ) -> *const std::ffi::c_void {
+        std::ptr::null()
+    }
+
+    unsafe extern "C" fn test_clap_out_events_push(
+        _list: *const TestClapOutputEvents,
+        _event: *const std::ffi::c_void,
+    ) -> bool {
+        true
+    }
+
+    fn process_clap_stereo_block(
+        plugin: *const nih_plug::wrapper::clap::clap_plugin,
+        sample_rate: f64,
+        steady_time: i64,
+        left: &[f32],
+        right: &[f32],
+    ) {
+        assert_eq!(left.len(), right.len());
+        let frames = left.len();
+        let mut in_l = left.to_vec();
+        let mut in_r = right.to_vec();
+        let mut out_l = vec![0.0_f32; frames];
+        let mut out_r = vec![0.0_f32; frames];
+
+        let mut in_ptrs = [in_l.as_mut_ptr(), in_r.as_mut_ptr()];
+        let mut out_ptrs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
+
+        let in_buf = TestClapAudioBuffer {
+            data32: in_ptrs.as_mut_ptr(),
+            data64: std::ptr::null_mut(),
+            channel_count: 2,
+            latency: 0,
+            constant_mask: 0,
+        };
+        let mut out_buf = TestClapAudioBuffer {
+            data32: out_ptrs.as_mut_ptr(),
+            data64: std::ptr::null_mut(),
+            channel_count: 2,
+            latency: 0,
+            constant_mask: 0,
+        };
+
+        let in_events = TestClapInputEvents {
+            ctx: std::ptr::null_mut(),
+            size: Some(test_clap_in_events_size),
+            get: Some(test_clap_in_events_get),
+        };
+        let out_events = TestClapOutputEvents {
+            ctx: std::ptr::null_mut(),
+            try_push: Some(test_clap_out_events_push),
+        };
+
+        let proc_data = TestClapProcess {
+            steady_time,
+            frames_count: frames as u32,
+            transport: std::ptr::null(),
+            audio_inputs: &in_buf,
+            audio_outputs: &mut out_buf,
+            audio_inputs_count: 1,
+            audio_outputs_count: 1,
+            in_events: &in_events,
+            out_events: &out_events,
+        };
+
+        unsafe {
+            let process_fn = (*plugin).process.expect("CLAP process callback missing");
+            let status = process_fn(
+                plugin,
+                &proc_data as *const TestClapProcess as *const _,
+            );
+            assert!(
+                status >= 1,
+                "Expected valid CLAP process status at {} Hz, got {}",
+                sample_rate,
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn test_clap_gain_adjustment_metering_abi_and_closed_ui() {
+        use nih_plug::wrapper::clap::{
+            clap_host, clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID, CLAP_VERSION,
+        };
+        use std::ffi::CStr;
+
+        let host_name = b"ReaperTestHost\0";
+        let host_vendor = b"CockosTest\0";
+        let host_url = b"https://example.invalid\0";
+        let host_ver = b"7.0\0";
+
+        let host = clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: std::ptr::null_mut(),
+            name: host_name.as_ptr() as *const std::ffi::c_char,
+            vendor: host_vendor.as_ptr() as *const std::ffi::c_char,
+            url: host_url.as_ptr() as *const std::ffi::c_char,
+            version: host_ver.as_ptr() as *const std::ffi::c_char,
+            get_extension: Some(test_clap_host_get_extension),
+            request_restart: Some(test_clap_host_noop),
+            request_process: Some(test_clap_host_noop),
+            request_callback: Some(test_clap_host_noop),
+        };
+
+        unsafe {
+            let init_fn = super::clap::clap_entry.init.expect("clap init missing");
+            assert!(init_fn(std::ptr::null()));
+
+            let get_factory_fn = super::clap::clap_entry
+                .get_factory
+                .expect("clap get_factory missing");
+            let factory = get_factory_fn(CLAP_PLUGIN_FACTORY_ID.as_ptr())
+                as *const clap_plugin_factory;
+            assert!(!factory.is_null(), "CLAP factory must not be null");
+
+            let count_fn = (*factory).get_plugin_count.unwrap();
+            assert_eq!(count_fn(factory), 1);
+
+            let desc_fn = (*factory).get_plugin_descriptor.unwrap();
+            let desc = desc_fn(factory, 0);
+            assert!(!desc.is_null());
+            assert_eq!(
+                CStr::from_ptr((*desc).id).to_str().unwrap(),
+                OmorePunch::CLAP_ID
+            );
+
+            let create_fn = (*factory).create_plugin.unwrap();
+            let plugin_a = create_fn(factory, &host, (*desc).id);
+            let plugin_b = create_fn(factory, &host, (*desc).id);
+            assert!(!plugin_a.is_null() && !plugin_b.is_null());
+
+            assert!(((*plugin_a).init.unwrap())(plugin_a));
+            assert!(((*plugin_b).init.unwrap())(plugin_b));
+
+            let get_ext_a = (*plugin_a).get_extension.unwrap();
+            let get_ext_b = (*plugin_b).get_extension.unwrap();
+            let gr_ext_id = b"clap.gain-adjustment-metering/0\0";
+            let ext_a = get_ext_a(
+                plugin_a,
+                gr_ext_id.as_ptr() as *const std::ffi::c_char,
+            ) as *const super::clap::ClapPluginGainAdjustmentMetering;
+            let ext_b = get_ext_b(
+                plugin_b,
+                gr_ext_id.as_ptr() as *const std::ffi::c_char,
+            ) as *const super::clap::ClapPluginGainAdjustmentMetering;
+            assert!(!ext_a.is_null() && !ext_b.is_null());
+            let get_gr_a = (*ext_a).get.expect("clap GR get callback missing");
+            let get_gr_b = (*ext_b).get.expect("clap GR get callback missing");
+
+            // Never call gui extension: UI stays closed throughout the entire test.
+            assert!(((*plugin_a).activate.unwrap())(plugin_a, 48000.0, 64, 512));
+            assert!(((*plugin_b).activate.unwrap())(plugin_b, 48000.0, 64, 512));
+            assert!(((*plugin_a).start_processing.unwrap())(plugin_a));
+            assert!(((*plugin_b).start_processing.unwrap())(plugin_b));
+
+            // Initial idle state must read exact +0.0 dB.
+            let idle_a = get_gr_a(plugin_a);
+            let idle_b = get_gr_b(plugin_b);
+            assert_eq!(idle_a.to_bits(), 0.0_f64.to_bits());
+            assert_eq!(idle_b.to_bits(), 0.0_f64.to_bits());
+
+            // Below default 0 dB threshold must keep GR at exact +0.0 dB.
+            let frames = 512;
+            let below_thresh: Vec<f32> = (0..frames)
+                .map(|i| {
+                    let phase = 2.0 * std::f32::consts::PI * 1000.0 * (i as f32) / 48000.0;
+                    0.5 * phase.sin()
+                })
+                .collect();
+            process_clap_stereo_block(plugin_a, 48000.0, 0, &below_thresh, &below_thresh);
+            assert_eq!(get_gr_a(plugin_a).to_bits(), 0.0_f64.to_bits());
+
+            // Drive >0 dBFS signal ONLY into instance A; instance B receives silence.
+            let mut hot = vec![0.0_f32; frames];
+            for (i, s) in hot.iter_mut().enumerate() {
+                let phase = 2.0 * std::f32::consts::PI * 1000.0 * (i as f32) / 48000.0;
+                *s = 2.5 * phase.sin();
+            }
+            let silence = vec![0.0_f32; frames];
+
+            for block in 0..8 {
+                process_clap_stereo_block(plugin_a, 48000.0, (block * frames) as i64, &hot, &hot);
+                process_clap_stereo_block(
+                    plugin_b,
+                    48000.0,
+                    (block * frames) as i64,
+                    &silence,
+                    &silence,
+                );
+            }
+
+            let active_a = get_gr_a(plugin_a);
+            let active_b = get_gr_b(plugin_b);
+            assert!(
+                (-MAX_GR_METER_DB as f64..=-0.5).contains(&active_a),
+                "Expected active CLAP GR in [-24.0, -0.5] dB with UI closed, got {}",
+                active_a
+            );
+            assert_eq!(
+                active_b.to_bits(),
+                0.0_f64.to_bits(),
+                "Silent second CLAP instance must remain isolated at 0.0 dB"
+            );
+
+            // Lifecycle resets must return GR to 0.0 dB.
+            ((*plugin_a).stop_processing.unwrap())(plugin_a);
+            assert_eq!(get_gr_a(plugin_a).to_bits(), 0.0_f64.to_bits());
+
+            assert!(((*plugin_a).start_processing.unwrap())(plugin_a));
+            process_clap_stereo_block(plugin_a, 48000.0, 0, &hot, &hot);
+            assert!(get_gr_a(plugin_a) < -0.5);
+            ((*plugin_a).deactivate.unwrap())(plugin_a);
+            assert_eq!(get_gr_a(plugin_a).to_bits(), 0.0_f64.to_bits());
+
+            assert!(((*plugin_a).activate.unwrap())(plugin_a, 48000.0, 64, 512));
+            assert!(((*plugin_a).start_processing.unwrap())(plugin_a));
+            process_clap_stereo_block(plugin_a, 48000.0, 0, &hot, &hot);
+            assert!(get_gr_a(plugin_a) < -0.5);
+            ((*plugin_a).reset.unwrap())(plugin_a);
+            assert_eq!(get_gr_a(plugin_a).to_bits(), 0.0_f64.to_bits());
+
+            ((*plugin_a).deactivate.unwrap())(plugin_a);
+            ((*plugin_b).stop_processing.unwrap())(plugin_b);
+            ((*plugin_b).deactivate.unwrap())(plugin_b);
+            ((*plugin_a).destroy.unwrap())(plugin_a);
+            ((*plugin_b).destroy.unwrap())(plugin_b);
+
+            if let Some(deinit_fn) = super::clap::clap_entry.deinit {
+                deinit_fn();
+            }
+        }
+    }
+
+    fn process_vst3_stereo_block(
+        proc_if: &nih_plug::wrapper::vst3::vst3_sys::VstPtr<
+            dyn nih_plug::wrapper::vst3::vst3_sys::vst::IAudioProcessor,
+        >,
+        left: &[f32],
+        right: &[f32],
+    ) {
+        use nih_plug::wrapper::vst3::vst3_sys::base::kResultOk;
+        use nih_plug::wrapper::vst3::vst3_sys::vst::{
+            AudioBusBuffers, IAudioProcessor, ProcessData, ProcessModes, SymbolicSampleSizes,
+        };
+        use std::ffi::c_void;
+
+        assert_eq!(left.len(), right.len());
+        let frames = left.len();
+        let mut in_l = left.to_vec();
+        let mut in_r = right.to_vec();
+        let mut out_l = vec![0.0_f32; frames];
+        let mut out_r = vec![0.0_f32; frames];
+
+        let mut in_ptrs = [
+            in_l.as_mut_ptr() as *mut c_void,
+            in_r.as_mut_ptr() as *mut c_void,
+        ];
+        let mut out_ptrs = [
+            out_l.as_mut_ptr() as *mut c_void,
+            out_r.as_mut_ptr() as *mut c_void,
+        ];
+
+        let mut in_bus = AudioBusBuffers {
+            num_channels: 2,
+            silence_flags: 0,
+            buffers: in_ptrs.as_mut_ptr(),
+        };
+        let mut out_bus = AudioBusBuffers {
+            num_channels: 2,
+            silence_flags: 0,
+            buffers: out_ptrs.as_mut_ptr(),
+        };
+
+        unsafe {
+            let mut data: ProcessData = std::mem::zeroed();
+            data.process_mode = ProcessModes::kRealtime as i32;
+            data.symbolic_sample_size = SymbolicSampleSizes::kSample32 as i32;
+            data.num_samples = frames as i32;
+            data.num_inputs = 1;
+            data.num_outputs = 1;
+            data.inputs = &mut in_bus;
+            data.outputs = &mut out_bus;
+
+            assert_eq!(proc_if.process(&mut data), kResultOk);
+        }
+    }
+
+    #[test]
+    fn test_vst3_gain_reduction_info_abi_and_closed_ui() {
+        use super::vst3::IGainReductionInfo;
+        use nih_plug::prelude::Vst3Plugin;
+        use nih_plug::wrapper::vst3::vst3_sys::base::{
+            kResultOk, IPluginBase, IPluginFactory, IPluginFactory2, IPluginFactory3, PClassInfo2,
+        };
+        use nih_plug::wrapper::vst3::vst3_sys::vst::{
+            BusDirections, IAudioProcessor, IComponent, IEditController, MediaTypes, ProcessModes,
+            ProcessSetup, SymbolicSampleSizes,
+        };
+        use nih_plug::wrapper::vst3::vst3_sys::{ComInterface, VstPtr, IID};
+
+        unsafe {
+            let factory_raw = super::vst3::GetPluginFactory();
+            assert!(!factory_raw.is_null());
+            let factory = VstPtr::<dyn IPluginFactory>::owned(factory_raw as *mut *mut _)
+                .expect("Failed to wrap VST3 factory");
+
+            assert_eq!(factory.count_classes(), 1);
+            let factory2 = factory
+                .cast::<dyn IPluginFactory2>()
+                .expect("IPluginFactory2 missing");
+            let _factory3 = factory
+                .cast::<dyn IPluginFactory3>()
+                .expect("IPluginFactory3 missing");
+
+            let mut info2: PClassInfo2 = std::mem::zeroed();
+            assert_eq!(factory2.get_class_info2(0, &mut info2), kResultOk);
+            assert_eq!(info2.cid.data, OmorePunch::PLATFORM_VST3_CLASS_ID);
+
+            let cid = IID {
+                data: OmorePunch::PLATFORM_VST3_CLASS_ID,
+            };
+
+            let mut raw_a = std::ptr::null_mut();
+            let mut raw_b = std::ptr::null_mut();
+            assert_eq!(
+                factory.create_instance(&cid, &<dyn IComponent>::IID, &mut raw_a),
+                kResultOk
+            );
+            assert_eq!(
+                factory.create_instance(&cid, &<dyn IComponent>::IID, &mut raw_b),
+                kResultOk
+            );
+
+            let comp_a = VstPtr::<dyn IComponent>::owned(raw_a as *mut *mut _).unwrap();
+            let comp_b = VstPtr::<dyn IComponent>::owned(raw_b as *mut *mut _).unwrap();
+
+            // IGainReductionInfo must be queryable from both IComponent and IEditController.
+            let gr_a = comp_a
+                .cast::<dyn super::vst3::IGainReductionInfo>()
+                .expect("IGainReductionInfo missing on IComponent");
+            let edit_a = comp_a
+                .cast::<dyn IEditController>()
+                .expect("IEditController missing");
+            let _gr_a_via_edit = edit_a
+                .cast::<dyn super::vst3::IGainReductionInfo>()
+                .expect("IGainReductionInfo missing on IEditController");
+
+            let gr_b = comp_b
+                .cast::<dyn super::vst3::IGainReductionInfo>()
+                .expect("IGainReductionInfo missing on second instance");
+
+            let proc_a = comp_a.cast::<dyn IAudioProcessor>().unwrap();
+            let proc_b = comp_b.cast::<dyn IAudioProcessor>().unwrap();
+
+            assert_eq!(comp_a.initialize(std::ptr::null_mut()), kResultOk);
+            assert_eq!(comp_b.initialize(std::ptr::null_mut()), kResultOk);
+
+            for comp in [&comp_a, &comp_b] {
+                assert_eq!(
+                    comp.activate_bus(MediaTypes::kAudio as i32, BusDirections::kInput as i32, 0, 1),
+                    kResultOk
+                );
+                assert_eq!(
+                    comp.activate_bus(
+                        MediaTypes::kAudio as i32,
+                        BusDirections::kOutput as i32,
+                        0,
+                        1
+                    ),
+                    kResultOk
+                );
+            }
+
+            let mut arr_in_a: u64 = 3;
+            let mut arr_out_a: u64 = 3;
+            let mut arr_in_b: u64 = 3;
+            let mut arr_out_b: u64 = 3;
+            assert_eq!(
+                proc_a.set_bus_arrangements(&mut arr_in_a, 1, &mut arr_out_a, 1),
+                kResultOk
+            );
+            assert_eq!(
+                proc_b.set_bus_arrangements(&mut arr_in_b, 1, &mut arr_out_b, 1),
+                kResultOk
+            );
+
+            let setup = ProcessSetup {
+                process_mode: ProcessModes::kRealtime as i32,
+                symbolic_sample_size: SymbolicSampleSizes::kSample32 as i32,
+                max_samples_per_block: 512,
+                sample_rate: 48000.0,
+            };
+            assert_eq!(proc_a.setup_processing(&setup), kResultOk);
+            assert_eq!(proc_b.setup_processing(&setup), kResultOk);
+            assert_eq!(comp_a.set_active(1), kResultOk);
+            assert_eq!(comp_b.set_active(1), kResultOk);
+            assert_eq!(proc_a.set_processing(1), kResultOk);
+            assert_eq!(proc_b.set_processing(1), kResultOk);
+
+            // Idle initial state must be exact +0.0 dB without opening create_view().
+            assert_eq!(gr_a.get_gain_reduction_value_in_db().to_bits(), 0.0_f64.to_bits());
+            assert_eq!(gr_b.get_gain_reduction_value_in_db().to_bits(), 0.0_f64.to_bits());
+
+            // Below default 0 dB threshold must stay at exact +0.0 dB.
+            let frames = 512;
+            let below_thresh: Vec<f32> = (0..frames)
+                .map(|i| {
+                    let phase = 2.0 * std::f32::consts::PI * 1000.0 * (i as f32) / 48000.0;
+                    0.5 * phase.sin()
+                })
+                .collect();
+            process_vst3_stereo_block(&proc_a, &below_thresh, &below_thresh);
+            assert_eq!(gr_a.get_gain_reduction_value_in_db().to_bits(), 0.0_f64.to_bits());
+
+            let mut hot = vec![0.0_f32; frames];
+            for (i, s) in hot.iter_mut().enumerate() {
+                let phase = 2.0 * std::f32::consts::PI * 1000.0 * (i as f32) / 48000.0;
+                *s = 2.5 * phase.sin();
+            }
+            let silence = vec![0.0_f32; frames];
+
+            for _ in 0..8 {
+                process_vst3_stereo_block(&proc_a, &hot, &hot);
+                process_vst3_stereo_block(&proc_b, &silence, &silence);
+            }
+
+            let active_a = gr_a.get_gain_reduction_value_in_db();
+            let active_b = gr_b.get_gain_reduction_value_in_db();
+            assert!(
+                (-MAX_GR_METER_DB as f64..=-0.5).contains(&active_a),
+                "Expected VST3 IGainReductionInfo in [-24.0, -0.5] dB with UI closed, got {}",
+                active_a
+            );
+            assert_eq!(
+                active_b.to_bits(),
+                0.0_f64.to_bits(),
+                "Silent second VST3 instance must remain at 0.0 dB"
+            );
+
+            // Lifecycle clears: set_processing(0), set_active(0), terminate()
+            assert_eq!(proc_a.set_processing(0), kResultOk);
+            assert_eq!(gr_a.get_gain_reduction_value_in_db().to_bits(), 0.0_f64.to_bits());
+
+            assert_eq!(proc_a.set_processing(1), kResultOk);
+            process_vst3_stereo_block(&proc_a, &hot, &hot);
+            assert!(gr_a.get_gain_reduction_value_in_db() < -0.5);
+            assert_eq!(comp_a.set_active(0), kResultOk);
+            assert_eq!(gr_a.get_gain_reduction_value_in_db().to_bits(), 0.0_f64.to_bits());
+
+            assert_eq!(comp_a.set_active(1), kResultOk);
+            process_vst3_stereo_block(&proc_a, &hot, &hot);
+            assert!(gr_a.get_gain_reduction_value_in_db() < -0.5);
+            assert_eq!(comp_a.terminate(), kResultOk);
+            assert_eq!(gr_a.get_gain_reduction_value_in_db().to_bits(), 0.0_f64.to_bits());
+            assert_eq!(comp_b.terminate(), kResultOk);
+        }
+    }
+
+    #[test]
+    fn test_no_exposed_gr_parameter_in_daw_formats() {
+        use nih_plug::prelude::{Params, Vst3Plugin};
+        use nih_plug::wrapper::clap::{
+            clap_host, clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID, CLAP_VERSION,
+        };
+        use nih_plug::wrapper::vst3::vst3_sys::base::{kResultOk, IPluginFactory};
+        use nih_plug::wrapper::vst3::vst3_sys::vst::{IComponent, IEditController, ParameterInfo};
+        use nih_plug::wrapper::vst3::vst3_sys::{ComInterface, VstPtr, IID};
+        use std::ffi::CStr;
+
+        // 1. Check nih-plug parameter map directly
+        let params = OmorePunchParams::default();
+        let param_map = params.param_map();
+        for (id, ptr, _) in &param_map {
+            let name = unsafe { ptr.name() };
+            assert_ne!(id, "gr_meter_db", "gr_meter_db must not be exposed");
+            assert!(
+                !name.to_ascii_lowercase().contains("gain reduction"),
+                "Unexpected GR parameter in param_map: {} ({})",
+                name,
+                id
+            );
+        }
+
+        // 2. Check CLAP clap.params extension
+        let host_name = b"ParamCheckHost\0";
+        let host = clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: std::ptr::null_mut(),
+            name: host_name.as_ptr() as *const std::ffi::c_char,
+            vendor: std::ptr::null(),
+            url: std::ptr::null(),
+            version: std::ptr::null(),
+            get_extension: Some(test_clap_host_get_extension),
+            request_restart: Some(test_clap_host_noop),
+            request_process: Some(test_clap_host_noop),
+            request_callback: Some(test_clap_host_noop),
+        };
+        unsafe {
+            assert!((super::clap::clap_entry.init.unwrap())(std::ptr::null()));
+            let factory = (super::clap::clap_entry.get_factory.unwrap())(
+                CLAP_PLUGIN_FACTORY_ID.as_ptr(),
+            ) as *const clap_plugin_factory;
+            let desc = ((*factory).get_plugin_descriptor.unwrap())(factory, 0);
+            let plugin = ((*factory).create_plugin.unwrap())(factory, &host, (*desc).id);
+            assert!(((*plugin).init.unwrap())(plugin));
+
+            let params_ext_id = b"clap.params\0";
+            let clap_params = ((*plugin).get_extension.unwrap())(
+                plugin,
+                params_ext_id.as_ptr() as *const std::ffi::c_char,
+            ) as *const TestClapPluginParams;
+            assert!(!clap_params.is_null());
+
+            let count = ((*clap_params).count.unwrap())(plugin);
+            assert_eq!(count as usize, param_map.len());
+            let get_info = (*clap_params).get_info.unwrap();
+            for idx in 0..count {
+                let mut info: TestClapParamInfo = std::mem::zeroed();
+                assert!(get_info(plugin, idx, &mut info));
+                let name = CStr::from_ptr(info.name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned();
+                assert!(
+                    !name.to_ascii_lowercase().contains("gain reduction"),
+                    "Unexpected CLAP GR parameter exposed: {}",
+                    name
+                );
+            }
+
+            ((*plugin).destroy.unwrap())(plugin);
+        }
+
+        // 3. Check VST3 IEditController parameter list
+        unsafe {
+            let factory =
+                VstPtr::<dyn IPluginFactory>::owned(super::vst3::GetPluginFactory() as *mut *mut _)
+                    .unwrap();
+            let cid = IID {
+                data: OmorePunch::PLATFORM_VST3_CLASS_ID,
+            };
+            let mut raw = std::ptr::null_mut();
+            assert_eq!(
+                factory.create_instance(&cid, &<dyn IComponent>::IID, &mut raw),
+                kResultOk
+            );
+            let comp = VstPtr::<dyn IComponent>::owned(raw as *mut *mut _).unwrap();
+            let edit = comp.cast::<dyn IEditController>().unwrap();
+            let count = edit.get_parameter_count();
+            assert_eq!(count as usize, param_map.len());
+            for idx in 0..count {
+                let mut info: ParameterInfo = std::mem::zeroed();
+                assert_eq!(edit.get_parameter_info(idx, &mut info), kResultOk);
+                let end = info.title.iter().position(|&c| c == 0).unwrap_or(128);
+                let utf16: Vec<u16> = info.title[..end].iter().map(|&c| c as u16).collect();
+                let title = String::from_utf16_lossy(&utf16);
+                assert!(
+                    !title.to_ascii_lowercase().contains("gain reduction"),
+                    "Unexpected VST3 GR parameter exposed: {}",
+                    title
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_host_gr_telemetry_parity_clamp_and_independence() {
+        // 1. Parity, normalization, clamping, and peak-reset isolation on MeterTelemetry
+        let telemetry = MeterTelemetry::default();
+        assert_eq!(telemetry.host_gain_reduction_db().to_bits(), 0.0_f64.to_bits());
+
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.0_f32, -2.5_f32, 0.0_f32] {
+            telemetry.current_gr_db.store(bad.to_bits(), Ordering::Relaxed);
+            assert_eq!(
+                telemetry.host_gain_reduction_db().to_bits(),
+                0.0_f64.to_bits(),
+                "Expected exact +0.0 for raw telemetry value {:?}",
+                bad
+            );
+        }
+
+        telemetry.current_gr_db.store(7.25_f32.to_bits(), Ordering::Relaxed);
+        telemetry.max_gr_db.store(12.5_f32.to_bits(), Ordering::Relaxed);
+        telemetry.clip_latched.store(true, Ordering::Relaxed);
+        assert!((telemetry.host_gain_reduction_db() + 7.25).abs() < 1e-6);
+
+        // User clicking UI Reset Peak must NOT clear live host current GR.
+        telemetry.reset_peaks();
+        assert!((telemetry.host_gain_reduction_db() + 7.25).abs() < 1e-6);
+        assert_eq!(
+            f32::from_bits(telemetry.max_gr_db.load(Ordering::Relaxed)),
+            0.0
+        );
+        assert!(!telemetry.clip_latched.load(Ordering::Relaxed));
+
+        // Explicit lifecycle clear resets current GR to exact +0.0.
+        telemetry.clear_gain_reduction();
+        assert_eq!(telemetry.host_gain_reduction_db().to_bits(), 0.0_f64.to_bits());
+
+        // Extreme reduction > MAX_GR_METER_DB clamps strictly to -24.0 dB.
+        telemetry.current_gr_db.store(38.0_f32.to_bits(), Ordering::Relaxed);
+        assert_eq!(telemetry.host_gain_reduction_db(), -(MAX_GR_METER_DB as f64));
+
+        // 2. Parity with internal compressor envelope and independence from mix, makeup, clipper, EQ, gain match
+        let sr = 48000.0_f32;
+        let base_cfg = DspConfig {
+            threshold_db: -24.0,
+            ratio: 8.0,
+            attack_ms: 1.0,
+            release_ms: 80.0,
+            sc_hpf_hz: 20.0,
+            auto_makeup: false,
+            makeup_db: 0.0,
+            clipper_mode: ClipperMode::Bypass,
+            ceiling_db: 0.0,
+            mix_pct: 100.0,
+            gain_match: false,
+            ..DspConfig::default()
+        };
+        let variant_cfg = DspConfig {
+            auto_makeup: true,
+            makeup_db: 9.5,
+            eq_low_cut_hz: 80.0,
+            eq_mid_cut_db: -4.0,
+            eq_high_shelf_db: 4.5,
+            clipper_mode: ClipperMode::HardClip,
+            ceiling_db: -6.0,
+            mix_pct: 25.0,
+            gain_match: true,
+            ..base_cfg
+        };
+        let zero_mix_cfg = DspConfig {
+            mix_pct: 0.0,
+            ..base_cfg
+        };
+
+        let mut dsp_base = StereoPunchDsp::new(sr);
+        let mut dsp_var = StereoPunchDsp::new(sr);
+        let mut dsp_dry = StereoPunchDsp::new(sr);
+        let tel_base = MeterTelemetry::default();
+
+        for n in 0..4096 {
+            let phase = 2.0 * std::f32::consts::PI * 500.0 * (n as f32) / sr;
+            let s = 0.7 * phase.sin();
+            dsp_base.process_sample(s, s, &base_cfg);
+            dsp_var.process_sample(s, s, &variant_cfg);
+            dsp_dry.process_sample(s, s, &zero_mix_cfg);
+
+            tel_base
+                .current_gr_db
+                .store(dsp_base.env_gr_db.to_bits(), Ordering::Relaxed);
+            let host_gr = tel_base.host_gain_reduction_db();
+            let ui_gr = -(dsp_base.env_gr_db.clamp(0.0, MAX_GR_METER_DB) as f64);
+
+            assert!(
+                (host_gr - ui_gr).abs() < 0.01,
+                "Host/UI GR diverged at sample {}: host={} ui={}",
+                n,
+                host_gr,
+                ui_gr
+            );
+            assert!(
+                (dsp_base.env_gr_db - dsp_var.env_gr_db).abs() < 1e-5
+                    && (dsp_base.env_gr_db - dsp_dry.env_gr_db).abs() < 1e-5,
+                "Post-compressor stages must not alter detector GR: base={} var={} dry={}",
+                dsp_base.env_gr_db,
+                dsp_var.env_gr_db,
+                dsp_dry.env_gr_db
+            );
+        }
+
+        // 3. Consistency across supported sample rates & block sizes + below-threshold silence return to 0.0
+        for &rate in &[44100.0_f64, 48000.0, 96000.0, 192000.0] {
+            for &block_size in &[32_usize, 128, 512, 2048] {
+                let mut plugin = OmorePunch::default();
+                let layout = AudioIOLayout::default();
+                let mut ctx = NoopInitContext;
+                let cfg = BufferConfig {
+                    sample_rate: rate as f32,
+                    min_buffer_size: Some(32),
+                    max_buffer_size: block_size as u32,
+                    process_mode: ProcessMode::Realtime,
+                };
+                assert!(plugin.initialize(&layout, &cfg, &mut ctx));
+
+                let mut dsp = StereoPunchDsp::new(rate as f32);
+                let total = ((0.06 * rate) as usize).max(block_size);
+                let mut processed = 0;
+                while processed < total {
+                    let count = (total - processed).min(block_size);
+                    for i in 0..count {
+                        let phase = 2.0 * std::f32::consts::PI * 1000.0 * ((processed + i) as f32)
+                            / (rate as f32);
+                        let s = 0.85 * phase.sin();
+                        dsp.process_sample(s, s, &base_cfg);
+                    }
+                    plugin
+                        .telemetry
+                        .current_gr_db
+                        .store(dsp.env_gr_db.to_bits(), Ordering::Relaxed);
+                    processed += count;
+                }
+
+                let active_gr = plugin.current_gain_adjustment_db();
+                assert!(
+                    (-MAX_GR_METER_DB as f64..=-1.0).contains(&active_gr),
+                    "Unexpected GR at {} Hz / {} frames: {}",
+                    rate,
+                    block_size,
+                    active_gr
+                );
+
+                // Plugin::reset() must clear host GR to 0.0 dB immediately.
+                plugin.reset();
+                assert_eq!(
+                    plugin.current_gain_adjustment_db().to_bits(),
+                    0.0_f64.to_bits()
+                );
+
+                // Extreme input produces <= -24.0 clamped safely at -24.0.
+                let mut extreme = StereoPunchDsp::new(rate as f32);
+                let crush_cfg = DspConfig {
+                    threshold_db: -40.0,
+                    ratio: 20.0,
+                    attack_ms: 0.1,
+                    ..base_cfg
+                };
+                for _ in 0..512 {
+                    extreme.process_sample(4.0, 4.0, &crush_cfg);
+                }
+                plugin
+                    .telemetry
+                    .current_gr_db
+                    .store(extreme.env_gr_db.to_bits(), Ordering::Relaxed);
+                assert_eq!(plugin.current_gain_adjustment_db(), -(MAX_GR_METER_DB as f64));
+
+                // Re-initializing plugin clears telemetry cleanly.
+                assert!(plugin.initialize(&layout, &cfg, &mut ctx));
+                assert_eq!(
+                    plugin.current_gain_adjustment_db().to_bits(),
+                    0.0_f64.to_bits()
+                );
+            }
+        }
+    }
+
+    struct NoopInitContext;
+    impl InitContext<OmorePunch> for NoopInitContext {
+        fn plugin_api(&self) -> PluginApi {
+            PluginApi::Clap
+        }
+
+        fn execute(&self, _task: <OmorePunch as Plugin>::BackgroundTask) {}
+
+        fn set_latency_samples(&self, _samples: u32) {}
+
+        fn set_current_voice_capacity(&self, _capacity: u32) {}
     }
 }
