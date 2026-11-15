@@ -1093,7 +1093,7 @@ impl Plugin for OmorePunch {
 // ----------------------------------------------------------------------------
 
 const UI_WINDOW_WIDTH: u32 = 820;
-const UI_WINDOW_HEIGHT: u32 = 480;
+const UI_WINDOW_HEIGHT: u32 = 620;
 const UI_LEFT_COL_WIDTH: f32 = 480.0;
 const UI_RIGHT_COL_WIDTH: f32 = 310.0;
 const UI_COL_GAP: f32 = 10.0;
@@ -1106,7 +1106,7 @@ const UI_KNOB_GRID_SPACING_Y: f32 = 4.0;
 const UI_KNOB_STEP_BTN_WIDTH: f32 = 22.0;
 const UI_KNOB_RESET_BTN_WIDTH: f32 = 46.0;
 const UI_KNOB_BTN_HEIGHT: f32 = 16.0;
-const UI_METER_HEIGHT: f32 = 255.0;
+const UI_METER_HEIGHT: f32 = 390.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SslKnobColor {
@@ -1609,7 +1609,7 @@ fn draw_omore_punch_ui(
             ui.spacing_mut().item_spacing.x = UI_COL_GAP;
 
             // ================================================================
-            // LEFT COLUMN: COMPRESSOR, CLIPPER & PARALLEL MIX CONTROLS
+            // LEFT COLUMN: COMPRESSOR, CLIPPER, PARALLEL MIX & DRUM BUS EQ
             // ================================================================
             ui.allocate_ui_with_layout(
                 egui::vec2(UI_LEFT_COL_WIDTH, ui.available_height()),
@@ -1846,6 +1846,46 @@ fn draw_omore_punch_ui(
                             );
                         });
                     });
+
+                    left_col.add_space(6.0);
+
+                    left_col.group(|ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            egui::RichText::new("3. DRUM BUS EQ")
+                                .monospace()
+                                .strong()
+                                .color(egui::Color32::from_rgb(245, 185, 35)),
+                        );
+                        ui.separator();
+
+                        let eq_knobs = [
+                            (&params.eq_low_cut_hz, "Low Cut", 5.0_f32, 20.0_f32, 160.0_f32),
+                            (&params.eq_mid_cut_db, "500Hz Cut", 0.5_f32, -12.0_f32, 0.0_f32),
+                            (
+                                &params.eq_high_shelf_db,
+                                "High Shelf",
+                                0.5_f32,
+                                -6.0_f32,
+                                12.0_f32,
+                            ),
+                        ];
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = UI_KNOB_GRID_SPACING_X;
+                            for &(param, label, step, min_val, max_val) in &eq_knobs {
+                                draw_ssl_knob_cell(
+                                    ui,
+                                    setter,
+                                    param,
+                                    label,
+                                    step,
+                                    min_val,
+                                    max_val,
+                                    SslKnobColor::Filter,
+                                );
+                            }
+                        });
+                    });
                 },
             );
 
@@ -1861,7 +1901,7 @@ fn draw_omore_punch_ui(
                     right_col.group(|ui| {
                         ui.set_width(ui.available_width());
                         ui.label(
-                            egui::RichText::new("3. GAIN REDUCTION & STEREO BUS METERING")
+                            egui::RichText::new("4. GAIN REDUCTION & STEREO BUS METERING")
                                 .monospace()
                                 .strong()
                                 .color(egui::Color32::from_rgb(245, 185, 35)),
@@ -2700,8 +2740,9 @@ mod tests {
         );
 
         // Combined left-column sections (Section 1: 2 knob rows + quick buttons; Section 2:
-        // clipper mode row + 1 knob row; group headers, separators, margins and gap) fit within
-        // CentralPanel height (UI_WINDOW_HEIGHT - header_and_panel_margins_px = 432.0 px).
+        // clipper mode row + 1 knob row; Section 3: 1 EQ knob row; group headers, separators,
+        // margins and gaps) fit within CentralPanel height
+        // (UI_WINDOW_HEIGHT - header_and_panel_margins_px = 572.0 px).
         let header_and_panel_margins_px = 48.0_f32;
         let available_left_col_height =
             UI_WINDOW_HEIGHT as f32 - header_and_panel_margins_px;
@@ -2714,8 +2755,13 @@ mod tests {
             + action_row_height_px;
         let section2_height =
             group_header_and_margins_px + action_row_height_px + 2.0 + UI_KNOB_CELL_HEIGHT;
+        let section3_height = group_header_and_margins_px + UI_KNOB_CELL_HEIGHT;
         let inter_section_gap_px = 6.0_f32;
-        let total_left_col_height = section1_height + inter_section_gap_px + section2_height;
+        let total_left_col_height = section1_height
+            + inter_section_gap_px
+            + section2_height
+            + inter_section_gap_px
+            + section3_height;
 
         assert!(
             total_left_col_height <= available_left_col_height,
@@ -2724,7 +2770,7 @@ mod tests {
             available_left_col_height
         );
 
-        // Empirically verify rendered egui layout fits within 820x480 px
+        // Empirically verify rendered egui layout fits within 820x620 px
         struct DummyGuiContext;
         impl GuiContext for DummyGuiContext {
             fn plugin_api(&self) -> PluginApi {

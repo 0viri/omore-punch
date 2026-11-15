@@ -72,12 +72,12 @@ description: "Task list for feature 003-drum-bus-eq (Section EQ 3 bandes pour Bu
 
 ### UI Implementation, Geometry Test & Documentation for User Story 2
 
-- [ ] T008 [US2] Update UI window height and meter height constants (`UI_WINDOW_HEIGHT: u32 = 620`, `UI_METER_HEIGHT: f32 = 390.0`) in block 4 of `src/lib.rs`
-- [ ] T009 [US2] Add section `3. DRUM BUS EQ` below `2. OUTPUT CLIPPER & PARALLEL MIX` in the left column of `draw_omore_punch_ui` with one 3-knob row using `draw_ssl_knob_cell` (`&params.eq_low_cut_hz` `"Low Cut"` step `5.0`, `20.0..=160.0`; `&params.eq_mid_cut_db` `"500Hz Cut"` step `0.5`, `-12.0..=0.0`; `&params.eq_high_shelf_db` `"High Shelf"` step `0.5`, `-6.0..=12.0`; all with `SslKnobColor::Filter`) and renumber the right-column metering header to `"4. GAIN REDUCTION & STEREO BUS METERING"` in block 4 of `src/lib.rs`
-- [ ] T010 [US2] Update `test_ui_layout_column_widths_fit_window` in `mod tests` of `src/lib.rs` to include `section3_height` (`group_header_and_margins_px + UI_KNOB_CELL_HEIGHT = 130.0` px) + `inter_section_gap_px` (`6.0` px) in `total_left_col_height` (`552.0 <= 572.0` px) and verify empirical `egui` rendering bounds inside `820x620` px
-- [ ] T011 [P] [US2] Document the `3. DRUM BUS EQ` section (`Low Cut`, `500Hz Cut`, `High Shelf`) and updated `4.` metering section in `README.md`
-- [ ] T012 [P] [US2] Add Drum Bus EQ usage instructions (`Low Cut`, `500Hz Cut`, `High Shelf`) in `USER_GUIDE.md`
-- [ ] T013 [P] [US2] Add an entry under `## [Unreleased]` (`### Ajouté`) describing the 3-band Drum Bus EQ section (`003-drum-bus-eq`) in `CHANGELOG.md`
+- [x] T008 [US2] Update UI window height and meter height constants (`UI_WINDOW_HEIGHT: u32 = 620`, `UI_METER_HEIGHT: f32 = 390.0`) in block 4 of `src/lib.rs`
+- [x] T009 [US2] Add section `3. DRUM BUS EQ` below `2. OUTPUT CLIPPER & PARALLEL MIX` in the left column of `draw_omore_punch_ui` with one 3-knob row using `draw_ssl_knob_cell` (`&params.eq_low_cut_hz` `"Low Cut"` step `5.0`, `20.0..=160.0`; `&params.eq_mid_cut_db` `"500Hz Cut"` step `0.5`, `-12.0..=0.0`; `&params.eq_high_shelf_db` `"High Shelf"` step `0.5`, `-6.0..=12.0`; all with `SslKnobColor::Filter`) and renumber the right-column metering header to `"4. GAIN REDUCTION & STEREO BUS METERING"` in block 4 of `src/lib.rs`
+- [x] T010 [US2] Update `test_ui_layout_column_widths_fit_window` in `mod tests` of `src/lib.rs` to include `section3_height` (`group_header_and_margins_px + UI_KNOB_CELL_HEIGHT = 130.0` px) + `inter_section_gap_px` (`6.0` px) in `total_left_col_height` (`552.0 <= 572.0` px) and verify empirical `egui` rendering bounds inside `820x620` px
+- [x] T011 [P] [US2] Document the `3. DRUM BUS EQ` section (`Low Cut`, `500Hz Cut`, `High Shelf`) and updated `4.` metering section in `README.md`
+- [x] T012 [P] [US2] Add Drum Bus EQ usage instructions (`Low Cut`, `500Hz Cut`, `High Shelf`) in `USER_GUIDE.md`
+- [x] T013 [P] [US2] Add an entry under `## [Unreleased]` (`### Ajouté`) describing the 3-band Drum Bus EQ section (`003-drum-bus-eq`) in `CHANGELOG.md`
 
 **Checkpoint**: User Stories 1 et 2 sont complètes — le DSP, l'UI en potards ronds SSL `820x620` px et la documentation sont alignés.
 

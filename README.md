@@ -12,8 +12,9 @@ Il extrait et adapte en bus stéréo lié l'algorithme de dynamique "Punch" et l
 - **Balistique "Omore Punch" :** Pré-réglage signature rapide (`Attack = 3.0 ms`, `Release = 80.0 ms`) accessible en un clic via `[Punch 3ms / 80ms]`.
 - **Compensation Auto-Makeup (35 %) :** Redonne instantanément du corps dès que l'on abaisse le `Threshold`, complétée par un `Makeup Gain` manuel (`-12 dB` à `+24 dB`).
 - **Étage Clipper Final :** 3 modes (`Soft Clip` cubique/tanh $C^1$ sans perte à faible niveau, `Hard Clip`, ou `Bypass`) avec plafond `Clip Ceiling` ajustable de `-6.0 dB` à `0.0 dB`.
+- **Section `3. DRUM BUS EQ` (Post-Compresseur / Pré-Clipper) :** Égaliseur stéréo apparié à 3 bandes ciblées (`Low Cut` passe-haut 12 dB/oct de `20.0 Hz` à `160.0 Hz` avec bypass à `<= 20.5 Hz`, `500Hz Cut` peaking de `0.0 dB` à `-12.0 dB` à `500 Hz`, et `High Shelf` 10 kHz de `-6.0 dB` à `+12.0 dB`) avec bypass strict aux positions neutres.
 - **Mix Parallèle (Dry/Wet) :** Dosage direct de `0 %` (100 % Dry au bit près) à `100 %` (100 % Wet) en phase.
-- **Interface Style Console SSL 100 % ASCII :** Disposition en grille de potentiomètres rotatifs gradués sur 270° à capuchons colorés par famille fonctionnelle (Ambre Gain/Drive, Argent Dynamique, Vert Enveloppe, Bleu Filtre SC, Rouge Clipper/Mix) sur thème sombre `Omore`, avec vu-mètres stéréo `In`/`Out` + `GR` temps réel et zéro caractère Unicode exotique pour un rendu identique sous Debian Linux et Windows 11.
+- **Interface Style Console SSL 100 % ASCII (`820x620` px) :** Disposition en 2 colonnes avec 3 sections de contrôle à gauche (`1. COMPRESSOR & ENVELOPE BALLISTICS`, `2. OUTPUT CLIPPER & PARALLEL MIX`, `3. DRUM BUS EQ`) en grille de potentiomètres rotatifs gradués sur 270° à capuchons colorés par famille fonctionnelle (Ambre Gain/Drive, Argent Dynamique, Vert Enveloppe, Bleu Filtre SC/EQ, Rouge Clipper/Mix) et section `4. GAIN REDUCTION & STEREO BUS METERING` à droite (`In`/`Out` + `GR` temps réel), sur thème sombre `Omore` et zéro caractère Unicode exotique pour un rendu identique sous Debian Linux et Windows 11.
 
 ## Compilation Locale (Debian / Windows)
 
