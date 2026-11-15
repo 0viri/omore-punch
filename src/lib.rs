@@ -1139,6 +1139,110 @@ fn draw_reaper_style_gr_meter(
     });
 }
 
+/// Splits a package version string into `(base_version, is_dev)`.
+/// Only the `-dev` suffix triggers the distinct `[DEV ...]` header badge;
+/// other pre-release suffixes (e.g. `-rc.1`) remain intact with `is_dev = false`.
+fn parse_display_version(version: &str) -> (&str, bool) {
+    match version.strip_suffix("-dev") {
+        Some(base) if !base.is_empty() => (base, true),
+        _ => (version, false),
+    }
+}
+
+/// Formats the development build badge label from the compile-time Git tag.
+/// Falls back to `"[DEV]"` when no valid ASCII Git tag is available.
+fn format_dev_badge_label(git_tag: &str) -> String {
+    let trimmed = git_tag.trim();
+    if trimmed.is_empty() || !trimmed.is_ascii() {
+        "[DEV]".to_string()
+    } else {
+        format!("[DEV {}]", trimmed)
+    }
+}
+
+fn draw_header_bar(
+    egui_ctx: &egui::Context,
+    telemetry: &MeterTelemetry,
+    raw_version: &str,
+    git_tag: &str,
+) {
+    let is_clipped = telemetry.clip_latched.load(Ordering::Relaxed);
+    let (base_version, is_dev) = parse_display_version(raw_version);
+    let header_amber = egui::Color32::from_rgb(245, 185, 35);
+    let header_text = |text: String| {
+        egui::RichText::new(text)
+            .monospace()
+            .strong()
+            .size(13.5)
+            .color(header_amber)
+    };
+
+    egui::TopBottomPanel::top("omore_punch_header").show(egui_ctx, |ui| {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+
+            if is_dev {
+                ui.label(header_text(format!("OMORE PUNCH v{}", base_version)));
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(28, 78, 120))
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        egui::Color32::from_rgb(70, 155, 220),
+                    ))
+                    .corner_radius(3.0)
+                    .inner_margin(egui::Margin::symmetric(5, 1))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format_dev_badge_label(git_tag))
+                                .monospace()
+                                .strong()
+                                .size(11.5)
+                                .color(egui::Color32::from_rgb(235, 248, 255)),
+                        );
+                    });
+                ui.label(header_text(
+                    "|  STEREO DRUM BUS COMPRESSOR & CLIPPER".to_string(),
+                ));
+            } else {
+                ui.label(header_text(format!(
+                    "OMORE PUNCH v{}  |  STEREO DRUM BUS COMPRESSOR & CLIPPER",
+                    base_version
+                )));
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let clip_text = if is_clipped {
+                    "[CLIP: ACTIVE - CLICK TO RESET]"
+                } else {
+                    "[CLIP: OK]"
+                };
+                let clip_color = if is_clipped {
+                    egui::Color32::from_rgb(220, 45, 45)
+                } else {
+                    egui::Color32::from_rgb(40, 55, 45)
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(clip_text)
+                                .monospace()
+                                .strong()
+                                .size(12.5)
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(clip_color),
+                    )
+                    .clicked()
+                {
+                    telemetry.clip_latched.store(false, Ordering::Relaxed);
+                }
+            });
+        });
+        ui.add_space(4.0);
+    });
+}
+
 fn draw_omore_punch_ui(
     egui_ctx: &egui::Context,
     setter: &ParamSetter,
@@ -1153,7 +1257,6 @@ fn draw_omore_punch_ui(
     let out_r = load_f32_relaxed(&telemetry.out_peak_r);
     let current_gr_db = load_f32_relaxed(&telemetry.current_gr_db);
     let max_gr_db = load_f32_relaxed(&telemetry.max_gr_db);
-    let is_clipped = telemetry.clip_latched.load(Ordering::Relaxed);
 
     // Keep Reaper's readable GR parameter synchronized while UI is open
     let target_gr_param = (-current_gr_db).clamp(-MAX_GR_METER_DB, 0.0);
@@ -1161,46 +1264,12 @@ fn draw_omore_punch_ui(
         setter.set_parameter(&params.gr_meter_db, target_gr_param);
     }
 
-    egui::TopBottomPanel::top("omore_punch_header").show(egui_ctx, |ui| {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    "OMORE PUNCH v{}  |  STEREO DRUM BUS COMPRESSOR & CLIPPER",
-                    env!("CARGO_PKG_VERSION")
-                ))
-                .monospace()
-                .strong()
-                .size(15.0)
-                .color(egui::Color32::from_rgb(245, 185, 35)),
-            );
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let clip_text = if is_clipped {
-                    "[CLIP: ACTIVE - CLICK TO RESET]"
-                } else {
-                    "[CLIP: OK]"
-                };
-                let clip_color = if is_clipped {
-                    egui::Color32::from_rgb(220, 45, 45)
-                } else {
-                    egui::Color32::from_rgb(40, 55, 45)
-                };
-                if ui
-                    .add(egui::Button::new(
-                        egui::RichText::new(clip_text)
-                            .monospace()
-                            .strong()
-                            .color(egui::Color32::WHITE),
-                    ).fill(clip_color))
-                    .clicked()
-                {
-                    telemetry.clip_latched.store(false, Ordering::Relaxed);
-                }
-            });
-        });
-        ui.add_space(4.0);
-    });
+    draw_header_bar(
+        egui_ctx,
+        telemetry,
+        env!("CARGO_PKG_VERSION"),
+        option_env!("OMORE_GIT_TAG").unwrap_or(""),
+    );
 
     egui::CentralPanel::default().show(egui_ctx, |ui| {
         ui.horizontal_top(|ui| {
@@ -2061,6 +2130,87 @@ mod tests {
         assert!(
             max_inner_right <= UI_WINDOW_WIDTH as f32 - 6.0,
             "Inner widgets right ({}) exceeds padded window width ({})",
+            max_inner_right,
+            UI_WINDOW_WIDTH as f32 - 6.0
+        );
+    }
+
+    #[test]
+    fn test_parse_display_version_variants() {
+        assert_eq!(parse_display_version("0.2.1-dev"), ("0.2.1", true));
+        assert_eq!(parse_display_version("0.2.1"), ("0.2.1", false));
+        assert_eq!(parse_display_version("0.3.0-rc.1"), ("0.3.0-rc.1", false));
+        assert_eq!(parse_display_version("1.0.0-alpha"), ("1.0.0-alpha", false));
+        assert_eq!(parse_display_version("-dev"), ("-dev", false));
+        assert_eq!(parse_display_version(""), ("", false));
+    }
+
+    #[test]
+    fn test_format_dev_badge_label_variants() {
+        assert_eq!(format_dev_badge_label("1d2c5b9"), "[DEV 1d2c5b9]");
+        assert_eq!(
+            format_dev_badge_label("1d2c5b9-dirty"),
+            "[DEV 1d2c5b9-dirty]"
+        );
+        assert_eq!(format_dev_badge_label("  1d2c5b9  "), "[DEV 1d2c5b9]");
+        assert_eq!(format_dev_badge_label(""), "[DEV]");
+        assert_eq!(format_dev_badge_label("   "), "[DEV]");
+        assert_eq!(format_dev_badge_label("bad\u{00e9}"), "[DEV]");
+    }
+
+    #[test]
+    fn test_host_version_matches_cargo_pkg_version() {
+        assert_eq!(OmorePunch::VERSION, env!("CARGO_PKG_VERSION"));
+        let (base_version, is_dev) = parse_display_version(OmorePunch::VERSION);
+        assert!(!base_version.is_empty());
+        assert_eq!(is_dev, env!("CARGO_PKG_VERSION").ends_with("-dev"));
+        if is_dev {
+            assert!(!base_version.ends_with("-dev"));
+        }
+    }
+
+    #[test]
+    fn test_ui_header_fits_window_with_dev_badge() {
+        // Empirical egui render of worst-case header:
+        // "[DEV 1d2c5b9-dirty]" on the left + "[CLIP: ACTIVE - CLICK TO RESET]" on the right
+        let ctx = egui::Context::default();
+        let telemetry = MeterTelemetry::default();
+        telemetry.clip_latched.store(true, Ordering::Relaxed);
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(UI_WINDOW_WIDTH as f32, UI_WINDOW_HEIGHT as f32),
+            )),
+            ..Default::default()
+        };
+
+        let mut final_output = None;
+        for _ in 0..2 {
+            final_output = Some(ctx.run(raw_input.clone(), |ctx| {
+                apply_omore_dark_theme(ctx);
+                draw_header_bar(ctx, &telemetry, "0.2.1-dev", "1d2c5b9-dirty");
+                egui::CentralPanel::default().show(ctx, |_| {});
+            }));
+        }
+        let used = ctx.used_rect();
+        assert!(
+            used.width() <= UI_WINDOW_WIDTH as f32,
+            "Rendered egui width ({}) with [DEV 1d2c5b9-dirty] + latched clip exceeds window width ({})",
+            used.width(),
+            UI_WINDOW_WIDTH
+        );
+        let max_inner_right = final_output
+            .expect("egui frame output missing")
+            .shapes
+            .iter()
+            .filter_map(|clipped| {
+                let rect = clipped.shape.visual_bounding_rect();
+                (rect.width() < UI_WINDOW_WIDTH as f32 - 1.0).then_some(rect.right())
+            })
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_inner_right <= UI_WINDOW_WIDTH as f32 - 6.0,
+            "Inner widgets right ({}) with [DEV 1d2c5b9-dirty] + latched clip exceeds padded window width ({})",
             max_inner_right,
             UI_WINDOW_WIDTH as f32 - 6.0
         );
