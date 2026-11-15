@@ -4,6 +4,9 @@ Toutes les modifications notables de ce projet sont documentées dans ce fichier
 
 ## [Unreleased]
 ### Modifié
+- **Badge `[DEV <hash>]` / `[DEV <hash>-dirty]` dans l'en-tête pour les versions de développement (`002-dev-version-tag`) :**
+  - Capture à la compilation via `build.rs` du hash court (7 caractères) du commit Git et de l'état `-dirty` éventuel (`OMORE_GIT_TAG`).
+  - Affichage d'un badge bleu-acier contrasté `[DEV <hash>]` ou `[DEV <hash>-dirty]` (repli sur `[DEV]` hors dépôt Git) à côté du numéro de version de base dans l'en-tête `egui`, tout en conservant un affichage épuré sans badge ni hash en release et la version complète exposée au DAW.
 - **Interface `egui` Style SSL avec Potentiomètres Rotatifs en Grille (`002-ssl-rotary-knobs-ui`) :**
   - Remplacement des 9 curseurs horizontaux (`draw_param_row`) par des potentiomètres rotatifs vectoriels (`draw_ssl_knob_cell`) sur couronne graduée à 270° (11 graduations) et capuchons colorés style console SSL intégrés au thème sombre `Omore`.
   - Disposition en grille compacte dans la fenêtre `820x480` px (`4` + `3` boutons en section `1.`, `2` boutons en section `2.`) sans chevauchement avec le metering à droite ni modification des identifiants DAW ou du moteur DSP.
