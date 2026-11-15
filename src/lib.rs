@@ -4,6 +4,10 @@
 // Compatible with Reaper on Linux (Debian) and Windows 11 (VST3 & CLAP)
 // ============================================================================
 
+// Suppress future-incompatibility lint triggered inside nih_plug::nih_export_vst3!
+// by transitive macro vst3_com::vtable! (Rust issue #79813).
+#![allow(semicolon_in_expressions_from_non_local_macros)]
+
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, EguiState};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};

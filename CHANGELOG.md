@@ -8,6 +8,8 @@ Toutes les modifications notables de ce projet sont documentées dans ce fichier
   - Remplacement du bouton rapide `[Kick Safe 90Hz]` par `[Snare Safe 200Hz]` réglant `SC HPF` sur `200.0 Hz` en un clic (technique Cristian Kohle) afin que ni le sous-grave de la grosse caisse ni le corps de la caisse claire ne fassent pomper le bus batterie.
 
 ### Corrigé
+- **Warning de compilation VST3 (`vst3-export-macro-warning`) :**
+  - Suppression du warning `semicolon_in_expressions_from_non_local_macros` émis par `rustc` lors de l'expansion de `nih_export_vst3!(OmorePunch)` (`vst3_com::vtable!`).
 - **Mise en page UI `egui` (`ui-columns-overlap`) :**
   - Suppression du chevauchement entre la colonne de gauche (sections `1.` et `2.`) et la colonne de droite (`3. GAIN REDUCTION & STEREO BUS METERING`) qui tronquait les boutons `Reset`.
   - Remplacement du partage rigide 50/50 (`ui.columns(2, ...)`) par deux colonnes asymétriques (`480 px` à gauche, `310 px` à droite) adaptées au contenu.
