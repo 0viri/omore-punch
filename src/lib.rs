@@ -764,12 +764,46 @@ const UI_WINDOW_HEIGHT: u32 = 480;
 const UI_LEFT_COL_WIDTH: f32 = 480.0;
 const UI_RIGHT_COL_WIDTH: f32 = 310.0;
 const UI_COL_GAP: f32 = 10.0;
-const UI_SLIDER_WIDTH: f32 = 140.0;
-const UI_STEP_BTN_WIDTH: f32 = 24.0;
-const UI_RESET_BTN_WIDTH: f32 = 48.0;
-const UI_ROW_HEIGHT: f32 = 22.0;
-const UI_ROW_ITEM_SPACING: f32 = 6.0;
+const UI_KNOB_COLS_MAX: usize = 4;
+const UI_KNOB_CELL_WIDTH: f32 = 110.0;
+const UI_KNOB_CELL_HEIGHT: f32 = 94.0;
+const UI_KNOB_DIAMETER: f32 = 44.0;
+const UI_KNOB_GRID_SPACING_X: f32 = 8.0;
+const UI_KNOB_GRID_SPACING_Y: f32 = 4.0;
+const UI_KNOB_STEP_BTN_WIDTH: f32 = 22.0;
+const UI_KNOB_RESET_BTN_WIDTH: f32 = 46.0;
+const UI_KNOB_BTN_HEIGHT: f32 = 16.0;
 const UI_METER_HEIGHT: f32 = 255.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SslKnobColor {
+    GainDrive,
+    Dynamics,
+    Envelope,
+    Filter,
+    ClipperMix,
+}
+
+impl SslKnobColor {
+    fn cap_color(self, active_or_hovered: bool) -> egui::Color32 {
+        let (r, g, b) = match self {
+            Self::GainDrive => (215_u8, 145_u8, 30_u8),
+            Self::Dynamics => (150_u8, 158_u8, 170_u8),
+            Self::Envelope => (55_u8, 155_u8, 95_u8),
+            Self::Filter => (55_u8, 125_u8, 195_u8),
+            Self::ClipperMix => (195_u8, 65_u8, 60_u8),
+        };
+        if active_or_hovered {
+            egui::Color32::from_rgb(
+                r.saturating_add(24),
+                g.saturating_add(24),
+                b.saturating_add(24),
+            )
+        } else {
+            egui::Color32::from_rgb(r, g, b)
+        }
+    }
+}
 
 fn apply_omore_dark_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
@@ -785,7 +819,7 @@ fn apply_omore_dark_theme(ctx: &egui::Context) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_param_row(
+fn draw_ssl_knob_cell(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
     param: &FloatParam,
@@ -793,76 +827,166 @@ fn draw_param_row(
     step: f32,
     min_val: f32,
     max_val: f32,
+    color_family: SslKnobColor,
 ) {
     let current_val = param.value();
     let default_val = param.default_plain_value();
     let formatted_val = param.to_string();
 
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = UI_ROW_ITEM_SPACING;
+    ui.allocate_ui_with_layout(
+        egui::vec2(UI_KNOB_CELL_WIDTH, UI_KNOB_CELL_HEIGHT),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            ui.set_width(UI_KNOB_CELL_WIDTH);
+            ui.spacing_mut().item_spacing.y = 2.0;
 
-        ui.label(
-            egui::RichText::new(format!("{:<12}", label))
-                .monospace()
-                .strong()
-                .color(egui::Color32::from_rgb(220, 224, 232)),
-        );
+            ui.label(
+                egui::RichText::new(label)
+                    .monospace()
+                    .strong()
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(220, 224, 232)),
+            );
 
-        if ui
-            .add_sized([UI_STEP_BTN_WIDTH, UI_ROW_HEIGHT], egui::Button::new("-"))
-            .on_hover_text("Decrease value")
-            .clicked()
-        {
-            let next_val = (current_val - step).clamp(min_val, max_val);
-            setter.begin_set_parameter(param);
-            setter.set_parameter(param, next_val);
-            setter.end_set_parameter(param);
-        }
+            let (knob_rect, resp) = ui.allocate_exact_size(
+                egui::vec2(UI_KNOB_DIAMETER, UI_KNOB_DIAMETER),
+                egui::Sense::click_and_drag(),
+            );
+            let resp = resp.on_hover_text(
+                "Drag vertically to adjust (hold Shift for fine control, double-click to reset)",
+            );
 
-        let mut slider_val = current_val;
-        ui.spacing_mut().slider_width = UI_SLIDER_WIDTH;
-        let slider_resp = ui.add_sized(
-            [UI_SLIDER_WIDTH, UI_ROW_HEIGHT],
-            egui::Slider::new(&mut slider_val, min_val..=max_val).show_value(false),
-        );
+            if resp.drag_started() {
+                setter.begin_set_parameter(param);
+            }
+            if resp.dragged() {
+                let dy = resp.drag_delta().y;
+                if dy.abs() > f32::EPSILON {
+                    let fine = ui.input(|i| i.modifiers.shift);
+                    let sensitivity = if fine { 600.0_f32 } else { 150.0_f32 };
+                    let current_norm = param.modulated_normalized_value();
+                    let next_norm = (current_norm - dy / sensitivity).clamp(0.0, 1.0);
+                    let next_plain = param.preview_plain(next_norm).clamp(min_val, max_val);
+                    setter.set_parameter(param, next_plain);
+                }
+            }
+            if resp.drag_stopped() {
+                setter.end_set_parameter(param);
+            }
+            if resp.double_clicked() {
+                setter.begin_set_parameter(param);
+                setter.set_parameter(param, default_val);
+                setter.end_set_parameter(param);
+            }
 
-        if slider_resp.drag_started() {
-            setter.begin_set_parameter(param);
-        }
-        if slider_resp.changed() {
-            setter.set_parameter(param, slider_val.clamp(min_val, max_val));
-        }
-        if slider_resp.drag_stopped() {
-            setter.end_set_parameter(param);
-        }
+            let norm = param.modulated_normalized_value().clamp(0.0, 1.0);
+            let painter = ui.painter();
+            let center = knob_rect.center();
+            let outer_r = UI_KNOB_DIAMETER * 0.5;
 
-        if ui
-            .add_sized([UI_STEP_BTN_WIDTH, UI_ROW_HEIGHT], egui::Button::new("+"))
-            .on_hover_text("Increase value")
-            .clicked()
-        {
-            let next_val = (current_val + step).clamp(min_val, max_val);
-            setter.begin_set_parameter(param);
-            setter.set_parameter(param, next_val);
-            setter.end_set_parameter(param);
-        }
+            // 11 radial graduation ticks over 270 deg (-135 deg to +135 deg from top vertical)
+            for idx in 0..=10 {
+                let tick_norm = (idx as f32) / 10.0;
+                let tick_angle = (-135.0_f32 + tick_norm * 270.0_f32).to_radians();
+                let dir = egui::vec2(tick_angle.sin(), -tick_angle.cos());
+                let p_in = center + dir * (outer_r - 4.0);
+                let p_out = center + dir * (outer_r - 0.5);
+                let tick_color = if tick_norm <= norm + 0.001 {
+                    egui::Color32::from_rgb(245, 185, 45)
+                } else {
+                    egui::Color32::from_rgb(85, 92, 108)
+                };
+                painter.line_segment([p_in, p_out], egui::Stroke::new(1.5_f32, tick_color));
+            }
 
-        ui.label(
-            egui::RichText::new(format!("{:>9}", formatted_val))
-                .monospace()
-                .color(egui::Color32::from_rgb(245, 185, 45)),
-        );
+            // Outer dark skirt
+            let skirt_r = outer_r - 5.5;
+            painter.circle_filled(center, skirt_r, egui::Color32::from_rgb(16, 18, 22));
+            painter.circle_stroke(
+                center,
+                skirt_r,
+                egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(62, 68, 82)),
+            );
 
-        if ui
-            .add_sized([UI_RESET_BTN_WIDTH, UI_ROW_HEIGHT], egui::Button::new("Reset"))
-            .on_hover_text("Reset to default value")
-            .clicked()
-        {
-            setter.begin_set_parameter(param);
-            setter.set_parameter(param, default_val);
-            setter.end_set_parameter(param);
-        }
-    });
+            // Inner SSL colored cap
+            let cap_r = outer_r - 8.5;
+            let active_or_hovered = resp.hovered() || resp.dragged();
+            painter.circle_filled(center, cap_r, color_family.cap_color(active_or_hovered));
+            painter.circle_stroke(
+                center,
+                cap_r,
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(25, 28, 34)),
+            );
+
+            // Angular pointer line
+            let val_angle = (-135.0_f32 + norm * 270.0_f32).to_radians();
+            let val_dir = egui::vec2(val_angle.sin(), -val_angle.cos());
+            painter.line_segment(
+                [center + val_dir * 2.5, center + val_dir * (skirt_r - 1.5)],
+                egui::Stroke::new(2.2_f32, egui::Color32::from_rgb(250, 250, 245)),
+            );
+            painter.circle_filled(center, 2.0, egui::Color32::from_rgb(25, 28, 34));
+
+            ui.label(
+                egui::RichText::new(formatted_val)
+                    .monospace()
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(245, 185, 45)),
+            );
+
+            ui.horizontal(|ui| {
+                let btn_gap = 3.0_f32;
+                let total_btns_w =
+                    2.0 * UI_KNOB_STEP_BTN_WIDTH + UI_KNOB_RESET_BTN_WIDTH + 2.0 * btn_gap;
+                let pad = ((UI_KNOB_CELL_WIDTH - total_btns_w) * 0.5).max(0.0);
+                ui.add_space(pad);
+                ui.spacing_mut().item_spacing.x = btn_gap;
+                ui.spacing_mut().button_padding = egui::vec2(2.0, 1.0);
+                ui.spacing_mut().interact_size.y = UI_KNOB_BTN_HEIGHT;
+
+                if ui
+                    .add_sized(
+                        [UI_KNOB_STEP_BTN_WIDTH, UI_KNOB_BTN_HEIGHT],
+                        egui::Button::new(egui::RichText::new("-").monospace().size(11.0)),
+                    )
+                    .on_hover_text("Decrease value")
+                    .clicked()
+                {
+                    let next_val = (current_val - step).clamp(min_val, max_val);
+                    setter.begin_set_parameter(param);
+                    setter.set_parameter(param, next_val);
+                    setter.end_set_parameter(param);
+                }
+
+                if ui
+                    .add_sized(
+                        [UI_KNOB_STEP_BTN_WIDTH, UI_KNOB_BTN_HEIGHT],
+                        egui::Button::new(egui::RichText::new("+").monospace().size(11.0)),
+                    )
+                    .on_hover_text("Increase value")
+                    .clicked()
+                {
+                    let next_val = (current_val + step).clamp(min_val, max_val);
+                    setter.begin_set_parameter(param);
+                    setter.set_parameter(param, next_val);
+                    setter.end_set_parameter(param);
+                }
+
+                if ui
+                    .add_sized(
+                        [UI_KNOB_RESET_BTN_WIDTH, UI_KNOB_BTN_HEIGHT],
+                        egui::Button::new(egui::RichText::new("Reset").monospace().size(10.5)),
+                    )
+                    .on_hover_text("Reset to default value")
+                    .clicked()
+                {
+                    setter.begin_set_parameter(param);
+                    setter.set_parameter(param, default_val);
+                    setter.end_set_parameter(param);
+                }
+            });
+        },
+    );
 }
 
 fn draw_vertical_level_meter(
@@ -1101,46 +1225,87 @@ fn draw_omore_punch_ui(
                         );
                         ui.separator();
 
-                        draw_param_row(
-                            ui,
-                            setter,
-                            &params.input_db,
-                            "Input Drive",
-                            0.5,
-                            -12.0,
-                            12.0,
-                        );
-                        draw_param_row(
-                            ui,
-                            setter,
-                            &params.threshold_db,
-                            "Threshold",
-                            0.5,
-                            -40.0,
-                            0.0,
-                        );
-                        draw_param_row(ui, setter, &params.ratio, "Ratio", 0.25, 1.0, 20.0);
-                        draw_param_row(ui, setter, &params.attack_ms, "Attack", 0.5, 0.1, 100.0);
-                        draw_param_row(
-                            ui,
-                            setter,
-                            &params.release_ms,
-                            "Release",
-                            5.0,
-                            10.0,
-                            500.0,
-                        );
-                        draw_param_row(
-                            ui,
-                            setter,
-                            &params.sc_hpf_hz,
-                            "SC HPF",
-                            5.0,
-                            20.0,
-                            250.0,
-                        );
+                        let comp_knobs = [
+                            (
+                                &params.input_db,
+                                "Input Drive",
+                                0.5_f32,
+                                -12.0_f32,
+                                12.0_f32,
+                                SslKnobColor::GainDrive,
+                            ),
+                            (
+                                &params.threshold_db,
+                                "Threshold",
+                                0.5,
+                                -40.0,
+                                0.0,
+                                SslKnobColor::Dynamics,
+                            ),
+                            (
+                                &params.ratio,
+                                "Ratio",
+                                0.25,
+                                1.0,
+                                20.0,
+                                SslKnobColor::Dynamics,
+                            ),
+                            (
+                                &params.attack_ms,
+                                "Attack",
+                                0.5,
+                                0.1,
+                                100.0,
+                                SslKnobColor::Envelope,
+                            ),
+                            (
+                                &params.release_ms,
+                                "Release",
+                                5.0,
+                                10.0,
+                                500.0,
+                                SslKnobColor::Envelope,
+                            ),
+                            (
+                                &params.sc_hpf_hz,
+                                "SC HPF",
+                                5.0,
+                                20.0,
+                                250.0,
+                                SslKnobColor::Filter,
+                            ),
+                            (
+                                &params.makeup_db,
+                                "Makeup Gain",
+                                0.5,
+                                -12.0,
+                                24.0,
+                                SslKnobColor::GainDrive,
+                            ),
+                        ];
 
-                        ui.add_space(4.0);
+                        for (row_idx, chunk) in comp_knobs.chunks(UI_KNOB_COLS_MAX).enumerate() {
+                            if row_idx > 0 {
+                                ui.add_space(UI_KNOB_GRID_SPACING_Y);
+                            }
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = UI_KNOB_GRID_SPACING_X;
+                                for &(param, label, step, min_val, max_val, color_family) in chunk {
+                                    draw_ssl_knob_cell(
+                                        ui,
+                                        setter,
+                                        param,
+                                        label,
+                                        step,
+                                        min_val,
+                                        max_val,
+                                        color_family,
+                                    );
+                                }
+                            });
+                        }
+
+                        ui.add_space(2.0);
                         ui.horizontal(|ui| {
                             if ui
                                 .button(
@@ -1206,20 +1371,9 @@ fn draw_omore_punch_ui(
                                 setter.end_set_parameter(&params.auto_makeup);
                             }
                         });
-
-                        ui.add_space(4.0);
-                        draw_param_row(
-                            ui,
-                            setter,
-                            &params.makeup_db,
-                            "Makeup Gain",
-                            0.5,
-                            -12.0,
-                            24.0,
-                        );
                     });
 
-                    left_col.add_space(8.0);
+                    left_col.add_space(6.0);
 
                     left_col.group(|ui| {
                         ui.set_width(ui.available_width());
@@ -1265,25 +1419,30 @@ fn draw_omore_punch_ui(
                             }
                         });
 
-                        ui.add_space(4.0);
-                        draw_param_row(
-                            ui,
-                            setter,
-                            &params.ceiling_db,
-                            "Clip Ceiling",
-                            0.25,
-                            -6.0,
-                            0.0,
-                        );
-                        draw_param_row(
-                            ui,
-                            setter,
-                            &params.mix_pct,
-                            "Mix Dry/Wet",
-                            5.0,
-                            0.0,
-                            100.0,
-                        );
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = UI_KNOB_GRID_SPACING_X;
+                            draw_ssl_knob_cell(
+                                ui,
+                                setter,
+                                &params.ceiling_db,
+                                "Clip Ceiling",
+                                0.25,
+                                -6.0,
+                                0.0,
+                                SslKnobColor::ClipperMix,
+                            );
+                            draw_ssl_knob_cell(
+                                ui,
+                                setter,
+                                &params.mix_pct,
+                                "Mix Dry/Wet",
+                                5.0,
+                                0.0,
+                                100.0,
+                                SslKnobColor::ClipperMix,
+                            );
+                        });
                     });
                 },
             );
@@ -1767,26 +1926,143 @@ mod tests {
             UI_WINDOW_WIDTH
         );
 
-        // Estimate draw_param_row width inside Group 1 / Group 2:
-        // 12-char monospace label (~96 px) + '-' button + slider + '+' button +
-        // 9-char monospace value (~72 px) + 'Reset' button + 5 item spacings + group margins (12 px)
-        let max_label_px = 12.0 * 8.0;
-        let max_value_px = 9.0 * 8.0;
-        let group_margins_px = 12.0;
-        let param_row_width = max_label_px
-            + UI_STEP_BTN_WIDTH
-            + UI_SLIDER_WIDTH
-            + UI_STEP_BTN_WIDTH
-            + max_value_px
-            + UI_RESET_BTN_WIDTH
-            + 5.0 * UI_ROW_ITEM_SPACING
+        // 4 SSL knob cells per row inside Group 1 + 3 grid gaps + group margins (12 px)
+        let group_margins_px = 12.0_f32;
+        let knob_row_width = (UI_KNOB_COLS_MAX as f32) * UI_KNOB_CELL_WIDTH
+            + ((UI_KNOB_COLS_MAX - 1) as f32) * UI_KNOB_GRID_SPACING_X
             + group_margins_px;
+        assert!(
+            knob_row_width <= UI_LEFT_COL_WIDTH,
+            "Knob row width ({}) overflows left column width ({})",
+            knob_row_width,
+            UI_LEFT_COL_WIDTH
+        );
+
+        // Compact button row ('-', '+', 'Reset') fits inside each knob cell
+        let cell_buttons_width =
+            2.0 * UI_KNOB_STEP_BTN_WIDTH + UI_KNOB_RESET_BTN_WIDTH + 2.0 * 3.0;
+        assert!(
+            cell_buttons_width <= UI_KNOB_CELL_WIDTH,
+            "Cell compact buttons width ({}) overflow knob cell width ({})",
+            cell_buttons_width,
+            UI_KNOB_CELL_WIDTH
+        );
+
+        // Combined left-column sections (Section 1: 2 knob rows + quick buttons; Section 2:
+        // clipper mode row + 1 knob row; group headers, separators, margins and gap) fit within
+        // CentralPanel height (UI_WINDOW_HEIGHT - header_and_panel_margins_px = 432.0 px).
+        let header_and_panel_margins_px = 48.0_f32;
+        let available_left_col_height =
+            UI_WINDOW_HEIGHT as f32 - header_and_panel_margins_px;
+        let group_header_and_margins_px = 36.0_f32;
+        let action_row_height_px = 24.0_f32;
+        let section1_height = group_header_and_margins_px
+            + 2.0 * UI_KNOB_CELL_HEIGHT
+            + UI_KNOB_GRID_SPACING_Y
+            + 2.0
+            + action_row_height_px;
+        let section2_height =
+            group_header_and_margins_px + action_row_height_px + 2.0 + UI_KNOB_CELL_HEIGHT;
+        let inter_section_gap_px = 6.0_f32;
+        let total_left_col_height = section1_height + inter_section_gap_px + section2_height;
 
         assert!(
-            param_row_width <= UI_LEFT_COL_WIDTH,
-            "Parameter row width ({}) overflows left column width ({})",
-            param_row_width,
-            UI_LEFT_COL_WIDTH
+            total_left_col_height <= available_left_col_height,
+            "Left column height ({}) overflows available panel height ({})",
+            total_left_col_height,
+            available_left_col_height
+        );
+
+        // Empirically verify rendered egui layout fits within 820x480 px
+        struct DummyGuiContext;
+        impl GuiContext for DummyGuiContext {
+            fn plugin_api(&self) -> PluginApi {
+                PluginApi::Standalone
+            }
+            fn request_resize(&self) -> bool {
+                false
+            }
+            unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
+            unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, _normalized: f32) {}
+            unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
+            fn get_state(&self) -> PluginState {
+                PluginState {
+                    version: String::new(),
+                    params: std::collections::BTreeMap::new(),
+                    fields: std::collections::BTreeMap::new(),
+                }
+            }
+            fn set_state(&self, _state: PluginState) {}
+        }
+
+        let ctx = egui::Context::default();
+        let params = Arc::new(OmorePunchParams::default());
+        let telemetry = Arc::new(MeterTelemetry::default());
+        let dummy_gui = DummyGuiContext;
+        let setter = ParamSetter::new(&dummy_gui);
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(UI_WINDOW_WIDTH as f32, UI_WINDOW_HEIGHT as f32),
+            )),
+            ..Default::default()
+        };
+
+        let mut final_output = None;
+        for _ in 0..2 {
+            final_output = Some(ctx.run(raw_input.clone(), |ctx| {
+                draw_omore_punch_ui(ctx, &setter, &params, &telemetry);
+            }));
+        }
+        let used = ctx.used_rect();
+        let shapes = final_output.expect("egui frame output missing").shapes;
+        let max_shape_bottom = shapes
+            .iter()
+            .map(|clipped| clipped.shape.visual_bounding_rect().bottom())
+            .fold(0.0_f32, f32::max);
+        let max_inner_bottom = shapes
+            .iter()
+            .filter_map(|clipped| {
+                let rect = clipped.shape.visual_bounding_rect();
+                (rect.width() < UI_WINDOW_WIDTH as f32 - 1.0).then_some(rect.bottom())
+            })
+            .fold(0.0_f32, f32::max);
+        let max_inner_right = shapes
+            .iter()
+            .filter_map(|clipped| {
+                let rect = clipped.shape.visual_bounding_rect();
+                (rect.width() < UI_WINDOW_WIDTH as f32 - 1.0).then_some(rect.right())
+            })
+            .fold(0.0_f32, f32::max);
+        assert!(
+            used.width() <= UI_WINDOW_WIDTH as f32,
+            "Rendered egui width ({}) exceeds window width ({})",
+            used.width(),
+            UI_WINDOW_WIDTH
+        );
+        assert!(
+            used.height() <= UI_WINDOW_HEIGHT as f32,
+            "Rendered egui height ({}) exceeds window height ({})",
+            used.height(),
+            UI_WINDOW_HEIGHT
+        );
+        assert!(
+            max_shape_bottom <= UI_WINDOW_HEIGHT as f32,
+            "Painted egui widgets bottom ({}) overflows window height ({})",
+            max_shape_bottom,
+            UI_WINDOW_HEIGHT
+        );
+        assert!(
+            max_inner_bottom <= UI_WINDOW_HEIGHT as f32 - 6.0,
+            "Inner widgets bottom ({}) exceeds padded window height ({})",
+            max_inner_bottom,
+            UI_WINDOW_HEIGHT as f32 - 6.0
+        );
+        assert!(
+            max_inner_right <= UI_WINDOW_WIDTH as f32 - 6.0,
+            "Inner widgets right ({}) exceeds padded window width ({})",
+            max_inner_right,
+            UI_WINDOW_WIDTH as f32 - 6.0
         );
     }
 }

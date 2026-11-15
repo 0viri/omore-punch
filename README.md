@@ -13,7 +13,7 @@ Il extrait et adapte en bus stéréo lié l'algorithme de dynamique "Punch" et l
 - **Compensation Auto-Makeup (35 %) :** Redonne instantanément du corps dès que l'on abaisse le `Threshold`, complétée par un `Makeup Gain` manuel (`-12 dB` à `+24 dB`).
 - **Étage Clipper Final :** 3 modes (`Soft Clip` cubique/tanh $C^1$ sans perte à faible niveau, `Hard Clip`, ou `Bypass`) avec plafond `Clip Ceiling` ajustable de `-6.0 dB` à `0.0 dB`.
 - **Mix Parallèle (Dry/Wet) :** Dosage direct de `0 %` (100 % Dry au bit près) à `100 %` (100 % Wet) en phase.
-- **Interface 100 % ASCII :** Zéro emoji et zéro caractère Unicode exotique, garantissant un rendu sans carré vide sous Debian Linux comme sous Windows 11.
+- **Interface Style Console SSL 100 % ASCII :** Disposition en grille de potentiomètres rotatifs gradués sur 270° à capuchons colorés par famille fonctionnelle (Ambre Gain/Drive, Argent Dynamique, Vert Enveloppe, Bleu Filtre SC, Rouge Clipper/Mix) sur thème sombre `Omore`, avec vu-mètres stéréo `In`/`Out` + `GR` temps réel et zéro caractère Unicode exotique pour un rendu identique sous Debian Linux et Windows 11.
 
 ## Compilation Locale (Debian / Windows)
 

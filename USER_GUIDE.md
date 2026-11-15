@@ -19,8 +19,8 @@ Copie les bundles générés depuis `target/bundled/` vers ton dossier de plugin
 7. Ajuste **`Mix Dry/Wet`** entre **`40 %` et `70 %`** pour doser la compression parallèle directement dans le plugin sans créer de piste auxiliaire supplémentaire.
 
 ## 3. Contrôles de Précision
-Chaque paramètre dispose :
-- de boutons **`-`** et **`+`** pour incrémenter par pas fins sans saut de souris,
-- d'un **`Slider`** glissant,
-- d'un bouton **`Reset`** individuel ramenant immédiatement le paramètre à sa valeur nominale,
-- d'un bouton **`[Reset Peak]`** remettant à zéro le compteur **`Max GR`** ainsi que le témoin **`[CLIP]`**.
+Chaque paramètre continu est présenté sous forme de **potentiomètre rotatif style SSL** disposant :
+- d'un réglage fluide par **glisser vertical** à la souris sur le bouton rond (maintenir **`Shift`** pour un réglage 4x plus fin),
+- d'un **double-clic** sur le bouton rond ou d'un clic sur **`Reset`** pour rétablir immédiatement sa valeur par défaut,
+- de petits boutons compacts **`-`** et **`+`** sous chaque potentiomètre pour incrémenter ou décrémenter par pas exacts sans saut de souris,
+- d'un bouton global **`[Reset Peak]`** remettant à zéro le compteur **`Max GR`** ainsi que le témoin **`[CLIP]`**.

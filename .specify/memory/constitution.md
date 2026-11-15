@@ -1,3 +1,15 @@
+<!--
+Sync Impact Report
+- Version change: 1.0.0 -> 1.1.0
+- Modified sections:
+  - Platform, Format & GUI Constraints -> GUI (expanded with SSL-style rotary knob grid standards and resolved TODO(GUI_STANDARDS))
+  - Governance (fixed GEMIDI.md typo -> GEMINI.md)
+- Added sections: none
+- Removed sections: none
+- Templates / guidance synchronized:
+  - GEMINI.md (Section 4 updated in lockstep)
+- Follow-up TODOs: none
+-->
 # Omore Punch Constitution
 
 ## Core Principles
@@ -96,9 +108,26 @@ in the UI identical.
   CI MUST build and test on both operating systems.
 - **Bundling:** `cargo run --package xtask --release -- bundle omore-punch --release` MUST produce
   `omore-punch.vst3` and `omore-punch.clap` in `target/bundled/`.
-- **GUI:** dark theme inspired by Omore Sampler, applied through `apply_omore_dark_theme`, and
-  ASCII-only text (Principle II). TODO(GUI_STANDARDS): `GEMIDI.md` section 4 is truncated;
-  complete the remaining `egui` standards there, then amend this bullet.
+- **GUI:**
+  - Dark theme inspired by Omore Sampler applied through `apply_omore_dark_theme` (`panel_fill`
+    `rgb(18, 19, 24)`, `window_fill` `rgb(24, 26, 32)`, `extreme_bg_color` `rgb(10, 11, 14)`,
+    amber/gold accents `rgb(225, 145, 25)` / `rgb(245, 185, 35)`), combined with SSL-inspired
+    color-coded rotary knob caps and graduated scales.
+  - Strictly ASCII-only text (Principle II) using `monospace()` typography for parameter labels,
+    formatted readouts and bracketed action buttons (`[Punch 3ms / 80ms]`, `[Snare Safe 200Hz]`,
+    `[Auto Makeup: ON]`, `[Soft Clip]`, `[Reset Peak]`, `[CLIP: OK]`).
+  - Top header bar showing `OMORE PUNCH v<VERSION>  |  STEREO DRUM BUS COMPRESSOR & CLIPPER` on
+    the left and the `[CLIP: OK]` / `[CLIP: ACTIVE - CLICK TO RESET]` indicator button on the
+    right.
+  - Two-column central layout fitting within the editor window without overlap: left column for
+    controls (`1. COMPRESSOR & ENVELOPE BALLISTICS` and `2. OUTPUT CLIPPER & PARALLEL MIX`) using
+    SSL-style rotary knobs arranged in a compact grid (graduated ring, color-coded cap, angular
+    pointer, vertical mouse drag, modifier fine-drag, double-click reset, formatted ASCII readout,
+    and compact `-`, `+` and `Reset` buttons wrapped in `begin_set_parameter` / `set_parameter` /
+    `end_set_parameter`); right column for metering (`3. GAIN REDUCTION & STEREO BUS METERING`)
+    with `GR` / `Max GR` readouts, `[Reset Peak]`, stereo `In L/R` and `Out L/R` bars, and a
+    Reaper-style top-down `GR (0 to -24 dB)` meter with peak hold.
+  - Continuous 60 FPS meter refresh via `egui_ctx.request_repaint()` while the editor is open.
 
 ## Development Workflow & Quality Gates
 
@@ -119,7 +148,7 @@ Additional rules:
 
 ## Governance
 
-This constitution supersedes every other development practice of Omore Punch. `GEMIDI.md`
+This constitution supersedes every other development practice of Omore Punch. `GEMINI.md`
 (loaded through `CLAUDE.md`) and `ARCHITECTURE.md` hold the detailed runtime guidance and MUST
 stay consistent with it: an amendment that changes a rule MUST update those files in the same
 change.
@@ -132,4 +161,4 @@ change.
 - **Compliance review:** every specification, plan and pull request MUST be checked against this
   constitution. CI enforces the quality gates; the other rules are checked in review.
 
-**Version**: 1.0.0 | **Ratified**: 2026-11-05 | **Last Amended**: 2026-11-05
+**Version**: 1.1.0 | **Ratified**: 2026-11-05 | **Last Amended**: 2026-11-14
