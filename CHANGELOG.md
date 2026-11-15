@@ -21,6 +21,9 @@ Toutes les modifications notables de ce projet sont documentées dans ce fichier
   - Remplacement du bouton rapide `[Kick Safe 90Hz]` par `[Snare Safe 200Hz]` réglant `SC HPF` sur `200.0 Hz` en un clic (technique Cristian Kohle) afin que ni le sous-grave de la grosse caisse ni le corps de la caisse claire ne fassent pomper le bus batterie.
 
 ### Corrigé
+- **Troncature verticale du bas de l'UI (`ui-bottom-clipping`) :**
+  - Suppression de la persistance de taille fixe (`#[persist = "editor-state"]`) sur `OmorePunchParams` (état d'éditeur déplacé sur `OmorePunch`) afin qu'une session ou un preset sauvegardé avant `003-drum-bus-eq` (`820x560` ou `820x480`) ne force plus une hauteur obsolète coupant la section `3. DRUM BUS EQ` et le bas des vu-mètres `In L/R` / `Out L/R`.
+  - Ajout d'un `ScrollArea::vertical()` de secours dans le `CentralPanel` si l'hôte impose une hauteur inférieure à `620` px, sans barre de défilement à la taille nominale `820x620`.
 - **Warning de compilation VST3 (`vst3-export-macro-warning`) :**
   - Suppression du warning `semicolon_in_expressions_from_non_local_macros` émis par `rustc` lors de l'expansion de `nih_export_vst3!(OmorePunch)` (`vst3_com::vtable!`).
 - **Mise en page UI `egui` (`ui-columns-overlap`) :**

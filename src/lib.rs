@@ -694,9 +694,6 @@ impl MeterTelemetry {
 
 #[derive(Params)]
 pub struct OmorePunchParams {
-    #[persist = "editor-state"]
-    pub editor_state: Arc<EguiState>,
-
     #[id = "input_db"]
     pub input_db: FloatParam,
 
@@ -748,8 +745,6 @@ pub struct OmorePunchParams {
 impl Default for OmorePunchParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(UI_WINDOW_WIDTH, UI_WINDOW_HEIGHT),
-
             input_db: FloatParam::new(
                 "Input Trim",
                 0.0,
@@ -924,6 +919,7 @@ impl Default for OmorePunchParams {
 
 pub struct OmorePunch {
     params: Arc<OmorePunchParams>,
+    editor_state: Arc<EguiState>,
     dsp: StereoPunchDsp,
     telemetry: Arc<MeterTelemetry>,
 }
@@ -932,6 +928,7 @@ impl Default for OmorePunch {
     fn default() -> Self {
         Self {
             params: Arc::new(OmorePunchParams::default()),
+            editor_state: EguiState::from_size(UI_WINDOW_WIDTH, UI_WINDOW_HEIGHT),
             dsp: StereoPunchDsp::default(),
             telemetry: Arc::new(MeterTelemetry::default()),
         }
@@ -994,7 +991,7 @@ impl Plugin for OmorePunch {
         let telemetry = self.telemetry.clone();
 
         create_egui_editor(
-            self.params.editor_state.clone(),
+            self.editor_state.clone(),
             (),
             |_, _| {},
             move |egui_ctx, setter, _state| {
@@ -1605,14 +1602,18 @@ fn draw_omore_punch_ui(
     );
 
     egui::CentralPanel::default().show(egui_ctx, |ui| {
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = UI_COL_GAP;
+        let panel_height = ui.available_height();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = UI_COL_GAP;
 
-            // ================================================================
-            // LEFT COLUMN: COMPRESSOR, CLIPPER, PARALLEL MIX & DRUM BUS EQ
-            // ================================================================
-            ui.allocate_ui_with_layout(
-                egui::vec2(UI_LEFT_COL_WIDTH, ui.available_height()),
+                    // ================================================================
+                    // LEFT COLUMN: COMPRESSOR, CLIPPER, PARALLEL MIX & DRUM BUS EQ
+                    // ================================================================
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(UI_LEFT_COL_WIDTH, panel_height),
                 egui::Layout::top_down(egui::Align::Min),
                 |left_col| {
                     left_col.set_width(UI_LEFT_COL_WIDTH);
@@ -1893,7 +1894,7 @@ fn draw_omore_punch_ui(
             // RIGHT COLUMN: GAIN REDUCTION & STEREO IN/OUT METERS
             // ================================================================
             ui.allocate_ui_with_layout(
-                egui::vec2(UI_RIGHT_COL_WIDTH, ui.available_height()),
+                egui::vec2(UI_RIGHT_COL_WIDTH, panel_height),
                 egui::Layout::top_down(egui::Align::Min),
                 |right_col| {
                     right_col.set_width(UI_RIGHT_COL_WIDTH);
@@ -1974,7 +1975,8 @@ fn draw_omore_punch_ui(
                     });
                 },
             );
-        });
+                });
+            });
     });
 
     // Request continuous 60 FPS repaint for smooth metering while editor is open
@@ -2957,5 +2959,35 @@ mod tests {
             max_inner_right,
             UI_WINDOW_WIDTH as f32 - 6.0
         );
+    }
+
+    #[test]
+    fn test_editor_size_ignores_legacy_persisted_editor_state() {
+        let plugin = OmorePunch::default();
+        assert_eq!(
+            plugin.editor_state.size(),
+            (UI_WINDOW_WIDTH, UI_WINDOW_HEIGHT)
+        );
+
+        // Serialized params must not persist fixed window dimensions across plugin upgrades
+        assert!(
+            !plugin.params.serialize_fields().contains_key("editor-state"),
+            "Fixed-size editor_state must not be persisted in DAW params state"
+        );
+
+        // Restoring a legacy DAW state (e.g. v0.2.0 820x560 or pre-EQ 820x480) must keep 820x620
+        for legacy_json in [r#"{"size":[820,560]}"#, r#"{"size":[820,480]}"#] {
+            let mut legacy_fields = std::collections::BTreeMap::new();
+            legacy_fields.insert("editor-state".to_string(), legacy_json.to_string());
+            plugin.params.deserialize_fields(&legacy_fields);
+            assert_eq!(
+                plugin.editor_state.size(),
+                (UI_WINDOW_WIDTH, UI_WINDOW_HEIGHT),
+                "Legacy editor-state '{}' must not shrink window below {}x{}",
+                legacy_json,
+                UI_WINDOW_WIDTH,
+                UI_WINDOW_HEIGHT
+            );
+        }
     }
 }
