@@ -3,6 +3,12 @@
 Toutes les modifications notables de ce projet sont documentées dans ce fichier.
 
 ## [Unreleased]
+### Ajouté
+- **Section EQ 3 bandes pour Bus Batterie `3. DRUM BUS EQ` (`003-drum-bus-eq`) :**
+  - Ajout d'un égaliseur stéréo apparié en série (biquads Direct Form II Transposed précalculés et mis en cache, placés post-compresseur et immédiatement pré-clipper) limité à trois contrôles : **`Low Cut`** (passe-haut Butterworth 12 dB/oct de `20.0 Hz` à `160.0 Hz`, bypass strict `<= 20.5 Hz`), **`500Hz Cut`** (peaking atténuateur à `500 Hz`, $Q = 1.0$, `0.0 dB` à `-12.0 dB`) et **`High Shelf`** (plateau haut à `10 kHz`, $S = 1.0$, `-6.0 dB` à `+12.0 dB`).
+  - Exposition des trois paramètres DAW automatables et rétrocompatibles (`eq_low_cut_hz`, `eq_mid_cut_db`, `eq_high_shelf_db`) initialisés à leurs valeurs neutres transparentes.
+  - Intégration dans la colonne de gauche de l'interface `egui` avec 3 potentiomètres rotatifs bleus SSL (`SslKnobColor::Filter`), renumérotation du metering à droite en `4. GAIN REDUCTION & STEREO BUS METERING`, ajustement de la fenêtre à `820x620` px (`UI_METER_HEIGHT = 390.0`) et ajout des tests unitaires DSP + géométrie UI.
+
 ### Modifié
 - **Badge `[DEV <hash>]` / `[DEV <hash>-dirty]` dans l'en-tête pour les versions de développement (`002-dev-version-tag`) :**
   - Capture à la compilation via `build.rs` du hash court (7 caractères) du commit Git et de l'état `-dirty` éventuel (`OMORE_GIT_TAG`).
