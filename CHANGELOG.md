@@ -3,6 +3,11 @@
 Toutes les modifications notables de ce projet sont documentées dans ce fichier.
 
 ## [Unreleased]
+### Ajouté
+- **Profils d'Auto-Release Dual-Stage `Release Mode` (`004-compressor-auto-release`) :**
+  - Ajout d'un sélecteur `ReleaseMode` à 4 états (`Manual` par défaut, `Auto Tight` `50/600 ms`, `Auto Punch` `80/800 ms`, `Auto Glue` `100/1200 ms`) exposé au DAW via le paramètre rétrocompatible `release_mode`.
+  - Implémentation dans `StereoPunchDsp` d'une enveloppe de relâchement à deux étages style console SSL (intégrateur lent `auto_slow_gr_db` chargé en `180 ms` servant de plancher progressif à l'étage rapide), temps réel safe sans allocation ni appel `.exp()` par échantillon, avec protection anti-dénormaux/NaN et réinitialisation de l'intégrateur lors des changements de fréquence d'échantillonnage ou `reset()`.
+  - Ajout de la rangée `Release Mode:` (`[Manual]`, `[Auto Tight]`, `[Auto Punch]`, `[Auto Glue]`) dans la section `1.`, atténuation visuelle et lecture `AUTO (<valeur>)` sur le potentiomètre `Release` lorsqu'un profil Auto est actif (tout en conservant l'édition manuelle pour pré-régler un retour en `Manual`), retour automatique en `Manual` lors du clic sur `[Punch 3ms / 80ms]`, ajustement de la fenêtre à `820x650` px (`UI_METER_HEIGHT = 416.0`) et ajout des tests unitaires DSP/UI dédiés.
 
 ## [0.3.0] - 2026-11-14
 ### Ajouté
