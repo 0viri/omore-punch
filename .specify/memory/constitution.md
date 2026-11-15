@@ -1,13 +1,12 @@
 <!--
 Sync Impact Report
-- Version change: 1.0.0 -> 1.1.0
+- Version change: 1.1.0 -> 1.2.0
 - Modified sections:
-  - Platform, Format & GUI Constraints -> GUI (expanded with SSL-style rotary knob grid standards and resolved TODO(GUI_STANDARDS))
-  - Governance (fixed GEMIDI.md typo -> GEMINI.md)
+  - Platform, Format & GUI Constraints -> GUI (added `3. DRUM BUS EQ` to the left-column control sections and renumbered the right-column metering section to `4. GAIN REDUCTION & STEREO BUS METERING`)
 - Added sections: none
 - Removed sections: none
-- Templates / guidance synchronized:
-  - GEMINI.md (Section 4 updated in lockstep)
+- Templates / guidance to synchronize manually:
+  - GEMINI.md (Section 4 still references the pre-EQ 2-section left column and `3.` metering)
 - Follow-up TODOs: none
 -->
 # Omore Punch Constitution
@@ -120,13 +119,14 @@ in the UI identical.
     the left and the `[CLIP: OK]` / `[CLIP: ACTIVE - CLICK TO RESET]` indicator button on the
     right.
   - Two-column central layout fitting within the editor window without overlap: left column for
-    controls (`1. COMPRESSOR & ENVELOPE BALLISTICS` and `2. OUTPUT CLIPPER & PARALLEL MIX`) using
-    SSL-style rotary knobs arranged in a compact grid (graduated ring, color-coded cap, angular
-    pointer, vertical mouse drag, modifier fine-drag, double-click reset, formatted ASCII readout,
-    and compact `-`, `+` and `Reset` buttons wrapped in `begin_set_parameter` / `set_parameter` /
-    `end_set_parameter`); right column for metering (`3. GAIN REDUCTION & STEREO BUS METERING`)
-    with `GR` / `Max GR` readouts, `[Reset Peak]`, stereo `In L/R` and `Out L/R` bars, and a
-    Reaper-style top-down `GR (0 to -24 dB)` meter with peak hold.
+    controls (`1. COMPRESSOR & ENVELOPE BALLISTICS`, `2. OUTPUT CLIPPER & PARALLEL MIX`, and
+    `3. DRUM BUS EQ`) using SSL-style rotary knobs arranged in a compact grid (graduated ring,
+    color-coded cap, angular pointer, vertical mouse drag, modifier fine-drag, double-click reset,
+    formatted ASCII readout, and compact `-`, `+` and `Reset` buttons wrapped in
+    `begin_set_parameter` / `set_parameter` / `end_set_parameter`); right column for metering
+    (`4. GAIN REDUCTION & STEREO BUS METERING`) with `GR` / `Max GR` readouts, `[Reset Peak]`,
+    stereo `In L/R` and `Out L/R` bars, and a Reaper-style top-down `GR (0 to -24 dB)` meter with
+    peak hold.
   - Continuous 60 FPS meter refresh via `egui_ctx.request_repaint()` while the editor is open.
 
 ## Development Workflow & Quality Gates
@@ -161,4 +161,4 @@ change.
 - **Compliance review:** every specification, plan and pull request MUST be checked against this
   constitution. CI enforces the quality gates; the other rules are checked in review.
 
-**Version**: 1.1.0 | **Ratified**: 2026-11-05 | **Last Amended**: 2026-11-14
+**Version**: 1.2.0 | **Ratified**: 2026-11-05 | **Last Amended**: 2026-11-14

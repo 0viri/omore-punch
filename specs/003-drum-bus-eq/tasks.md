@@ -30,7 +30,7 @@ description: "Task list for feature 003-drum-bus-eq (Section EQ 3 bandes pour Bu
 
 **Purpose**: Vérifier l'état initial de compilation, de conformité ASCII et de tests avant toute modification de `src/lib.rs`.
 
-- [ ] T001 Verify baseline ASCII check (`LC_ALL=C grep -n '[^[:print:][:space:]]' src/lib.rs`) and release unit tests (`cargo test --release`) on `src/lib.rs`
+- [x] T001 Verify baseline ASCII check (`LC_ALL=C grep -n '[^[:print:][:space:]]' src/lib.rs`) and release unit tests (`cargo test --release`) on `src/lib.rs`
 
 ---
 
@@ -40,8 +40,8 @@ description: "Task list for feature 003-drum-bus-eq (Section EQ 3 bandes pour Bu
 
 **⚠️ CRITICAL**: Aucune modification des identifiants `#[id = "..."]` ou plages existantes dans `OmorePunchParams`. Tout code du bloc 1 doit être 100 % temps réel (zéro allocation, zéro verrou) et 100 % ASCII.
 
-- [ ] T002 Define `BiquadCoeffs` (`b0: f32`, `b1: f32`, `b2: f32`, `a1: f32`, `a2: f32`, `bypass: bool`) and `StereoBiquad` (`coeffs: BiquadCoeffs`, `z1_l: f32`, `z2_l: f32`, `z1_r: f32`, `z2_r: f32`, plus `reset()` zeroing all 4 states) in block 1 of `src/lib.rs`
-- [ ] T003 Add `eq_low_cut_hz: f32` (default `20.0`), `eq_mid_cut_db: f32` (default `0.0`), and `eq_high_shelf_db: f32` (default `0.0`) to `DspConfig`, and add `eq_low_cut: StereoBiquad`, `eq_mid_cut: StereoBiquad`, `eq_high_shelf: StereoBiquad` plus cached fields (`cached_eq_low_cut_hz: -1.0`, `cached_eq_mid_cut_db: -999.0`, `cached_eq_high_shelf_db: -999.0`) with reset and sample-rate cache invalidation in `StereoPunchDsp::default()`, `reset()`, and `set_sample_rate()` in block 1 of `src/lib.rs`
+- [x] T002 Define `BiquadCoeffs` (`b0: f32`, `b1: f32`, `b2: f32`, `a1: f32`, `a2: f32`, `bypass: bool`) and `StereoBiquad` (`coeffs: BiquadCoeffs`, `z1_l: f32`, `z2_l: f32`, `z1_r: f32`, `z2_r: f32`, plus `reset()` zeroing all 4 states) in block 1 of `src/lib.rs`
+- [x] T003 Add `eq_low_cut_hz: f32` (default `20.0`), `eq_mid_cut_db: f32` (default `0.0`), and `eq_high_shelf_db: f32` (default `0.0`) to `DspConfig`, and add `eq_low_cut: StereoBiquad`, `eq_mid_cut: StereoBiquad`, `eq_high_shelf: StereoBiquad` plus cached fields (`cached_eq_low_cut_hz: -1.0`, `cached_eq_mid_cut_db: -999.0`, `cached_eq_high_shelf_db: -999.0`) with reset and sample-rate cache invalidation in `StereoPunchDsp::default()`, `reset()`, and `set_sample_rate()` in block 1 of `src/lib.rs`
 
 **Checkpoint**: Structures DSP de base prêtes — l'implémentation des User Stories peut commencer.
 
@@ -59,6 +59,7 @@ description: "Task list for feature 003-drum-bus-eq (Section EQ 3 bandes pour Bu
 - [x] T005 [US1] Implement `StereoBiquad::process_sample` (Direct Form II Transposed with per-sample `NaN`/`Inf` and `< 1.0e-20 => 0.0` denormal protection on `z1_l, z2_l, z1_r, z2_r`, and strict bypass zeroing states when `coeffs.bypass`) and insert stage `5b. Drum Bus EQ` (`eq_low_cut` -> `eq_mid_cut` -> `eq_high_shelf`) in `StereoPunchDsp::process_sample` immediately after `comp_l`/`comp_r` and before stage `6. Final Clipper Stage` in block 1 of `src/lib.rs`
 - [x] T006 [US1] Add `eq_low_cut_hz` (`#[id = "eq_low_cut_hz"]`, `"EQ Low Cut"`, default `20.0`, `FloatRange::Skewed { min: 20.0, max: 160.0, factor: FloatRange::skew_factor(-1.0) }`, `SmoothingStyle::Linear(5.0)`, unit `" Hz"`, `v2s_f32_rounded(1)`), `eq_mid_cut_db` (`#[id = "eq_mid_cut_db"]`, `"EQ 500Hz Cut"`, default `0.0`, `FloatRange::Linear { min: -12.0, max: 0.0 }`, `SmoothingStyle::Linear(5.0)`, unit `" dB"`, `v2s_f32_rounded(2)`), and `eq_high_shelf_db` (`#[id = "eq_high_shelf_db"]`, `"EQ High Shelf"`, default `0.0`, `FloatRange::Linear { min: -6.0, max: 12.0 }`, `SmoothingStyle::Linear(5.0)`, unit `" dB"`, `v2s_f32_rounded(2)`) to `OmorePunchParams` and populate `DspConfig` from `self.params.*.smoothed.next()` in `OmorePunch::process()` in block 3 of `src/lib.rs`
 - [x] T007 [US1] Add EQ unit tests (`test_eq_neutral_bypass_transparency`, `test_eq_low_cut_sub_attenuation` across `44100.0`/`48000.0`/`96000.0` Hz, `test_eq_500hz_cut_attenuation`, `test_eq_high_shelf_boost_and_cut` including post-EQ clipper ceiling enforcement) and update existing `DspConfig` struct literals and `test_nan_inf_and_safety_clamp` in `mod tests` of `src/lib.rs`
+- [x] T007b [US1] Extend `test_eq_500hz_cut_attenuation` and `test_eq_high_shelf_boost_and_cut` to verify `44100.0`, `48000.0`, and `96000.0` Hz sample rates (`SC-002`) in `mod tests` of `src/lib.rs`
 
 **Checkpoint**: User Story 1 (MVP) est complète — l'EQ 3 bandes DSP fonctionne en temps réel, est automatable par le DAW et est validé par les tests unitaires.
 
@@ -87,11 +88,11 @@ description: "Task list for feature 003-drum-bus-eq (Section EQ 3 bandes pour Bu
 
 **Purpose**: Exécuter l'audit temps réel et tous les contrôles qualité obligatoires (ASCII, tests Release, bundles VST3/CLAP).
 
-- [ ] T014 Audit `StereoPunchDsp` and `OmorePunch::process()` in `src/lib.rs` against Constitution Principles III & IV (zero heap allocation, zero locks, cached coefficients, `NaN`/`Inf`/denormal protection, `sanitize_sample()` final clamp)
-- [ ] T015 Run strict ASCII check `LC_ALL=C grep -n '[^[:print:][:space:]]' src/lib.rs` on `src/lib.rs` (must return no output)
-- [ ] T016 Run full release unit test suite `cargo test --release` on `src/lib.rs` (must pass with zero compiler warnings)
-- [ ] T017 Build VST3 and CLAP bundles with `cargo run --package xtask --release -- bundle omore-punch --release` and confirm `target/bundled/omore-punch.vst3` and `target/bundled/omore-punch.clap`
-- [ ] T018 Verify automated checklist items 1-3 in `specs/003-drum-bus-eq/quickstart.md` and note manual DAW verification (step 4 in Reaper)
+- [x] T014 Audit `StereoPunchDsp` and `OmorePunch::process()` in `src/lib.rs` against Constitution Principles III & IV (zero heap allocation, zero locks, cached coefficients, `NaN`/`Inf`/denormal protection, `sanitize_sample()` final clamp)
+- [x] T015 Run strict ASCII check `LC_ALL=C grep -n '[^[:print:][:space:]]' src/lib.rs` on `src/lib.rs` (must return no output)
+- [x] T016 Run full release unit test suite `cargo test --release` on `src/lib.rs` (must pass with zero compiler warnings)
+- [x] T017 Build VST3 and CLAP bundles with `cargo run --package xtask --release -- bundle omore-punch --release` and confirm `target/bundled/omore-punch.vst3` and `target/bundled/omore-punch.clap`
+- [x] T018 Verify automated checklist items 1-3 in `specs/003-drum-bus-eq/quickstart.md` and note manual DAW verification (step 4 in Reaper)
 
 ---
 
