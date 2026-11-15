@@ -57,12 +57,12 @@ Ce fichier définit les règles d'architecture, de DSP temps réel, d'interface 
 
 ## 4. Standards de l'Interface Graphique (`egui`)
 - **Style & Palette (`apply_omore_dark_theme`) :**
-  - Thème sombre inspiré d'`Omore Sampler` : fond de panneau `rgb(18, 19, 24)`, fond de fenêtre `rgb(24, 26, 32)`, fond extrême/jauges `rgb(10, 11, 14)`, widgets inactifs `rgb(38, 41, 52)`, survol `rgb(56, 61, 78)`, accentuation ambre/or `rgb(225, 145, 25)` / `rgb(245, 185, 35)`.
+  - Thème sombre inspiré d'`Omore Sampler` : fond de panneau `rgb(18, 19, 24)`, fond de fenêtre `rgb(24, 26, 32)`, fond extrême/jauges `rgb(10, 11, 14)`, widgets inactifs `rgb(38, 41, 52)`, survol `rgb(56, 61, 78)`, accentuation ambre/or `rgb(225, 145, 25)` / `rgb(245, 185, 35)`, combiné avec des potentiomètres rotatifs style console SSL à capuchons colorés par famille fonctionnelle et couronne graduée.
 - **Texte & Typographie :**
   - 100 % ASCII strict (règle 2.2) avec police `monospace()` pour les étiquettes de paramètres, valeurs numériques et boutons d'action entre crochets (`[Punch 3ms / 80ms]`, `[Snare Safe 200Hz]`, `[Auto Makeup: ON]`, `[Soft Clip]`, `[Reset Peak]`, `[CLIP: OK]`).
 - **Structure en 2 Colonnes & En-tête :**
   - Bandeau supérieur (`TopBottomPanel::top`) affichant `OMORE PUNCH v<VERSION>  |  STEREO DRUM BUS COMPRESSOR & CLIPPER` à gauche et le témoin/bouton d'acquittement `[CLIP: OK]` / `[CLIP: ACTIVE - CLICK TO RESET]` à droite.
-  - Colonne gauche dédiée aux contrôles (`1. COMPRESSOR & ENVELOPE BALLISTICS` et `2. OUTPUT CLIPPER & PARALLEL MIX`), chaque paramètre utilisant `draw_param_row` (label aligné, bouton `-`, slider, bouton `+`, lecture numérique formatée, bouton `Reset` encadré par `begin_set_parameter` / `set_parameter` / `end_set_parameter`).
+  - Colonne gauche dédiée aux contrôles (`1. COMPRESSOR & ENVELOPE BALLISTICS` et `2. OUTPUT CLIPPER & PARALLEL MIX`), disposés en grille compacte de potentiomètres rotatifs style SSL (étiquette alignée, couronne graduée, capuchon coloré par famille, repère angulaire, glisser vertical souris avec réglage fin sous `Shift`, double-clic de remise à zéro, lecture numérique formatée et petits boutons compacts `-`, `+` et `Reset`, le tout encadré par `begin_set_parameter` / `set_parameter` / `end_set_parameter`).
   - Colonne droite dédiée au metering (`3. GAIN REDUCTION & STEREO BUS METERING`) : afficheurs numériques `GR` et `Max GR`, bouton `[Reset Peak]`, vu-mètres stéréo `In L/R` et `Out L/R`, et jauge verticale `GR (0 to -24 dB)` descendante style Reaper avec ligne de maintien de crête (`Peak GR Hold`).
 - **Rafraîchissement :**
   - Appel à `egui_ctx.request_repaint()` en fin de rendu pour garantir un affichage fluide (60 FPS) des vu-mètres tant que la fenêtre de l'éditeur est ouverte.

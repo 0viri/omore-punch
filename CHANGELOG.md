@@ -4,6 +4,10 @@ Toutes les modifications notables de ce projet sont documentées dans ce fichier
 
 ## [Unreleased]
 ### Modifié
+- **Interface `egui` Style SSL avec Potentiomètres Rotatifs en Grille (`002-ssl-rotary-knobs-ui`) :**
+  - Remplacement des 9 curseurs horizontaux (`draw_param_row`) par des potentiomètres rotatifs vectoriels (`draw_ssl_knob_cell`) sur couronne graduée à 270° (11 graduations) et capuchons colorés style console SSL intégrés au thème sombre `Omore`.
+  - Disposition en grille compacte dans la fenêtre `820x480` px (`4` + `3` boutons en section `1.`, `2` boutons en section `2.`) sans chevauchement avec le metering à droite ni modification des identifiants DAW ou du moteur DSP.
+  - Contrôle à la souris par glisser vertical (réglage fin 4x sous `Shift`, double-clic reset) et conservation des petits boutons compacts `-`, `+` et `Reset` sous chaque potentiomètre.
 - **Bouton Rapide `[Snare Safe 200Hz]` dans l'interface `egui` (`001-snare-safe-200hz`) :**
   - Remplacement du bouton rapide `[Kick Safe 90Hz]` par `[Snare Safe 200Hz]` réglant `SC HPF` sur `200.0 Hz` en un clic (technique Cristian Kohle) afin que ni le sous-grave de la grosse caisse ni le corps de la caisse claire ne fassent pomper le bus batterie.
 
