@@ -4,6 +4,9 @@ Toutes les modifications notables de ce projet sont documentées dans ce fichier
 
 ## [Unreleased]
 ### Ajouté
+- **Metering natif de Gain Reduction DAW (`007-gain-reduction-metering`) :**
+  - Exposition de la télémétrie native **VST3** (`PreSonus::IGainReductionInfo`) et **CLAP** (`clap.gain-adjustment-metering/0`) via des proxys locaux autour des wrappers `nih-plug` dans `src/lib.rs`, pour l'affichage en temps réel de la jauge jaune de réduction de gain dans les tranches de mixage Reaper (MCP/TCP) sous Linux et Windows.
+  - Lecture lock-free de l'enveloppe brute du compresseur (`[-24.0, 0.0]` dB), isolée par instance et indépendante du make-up gain, de l'EQ, du clipper, du mix parallèle Dry/Wet, du Gain Match et de l'état d'ouverture de l'éditeur UI, avec remise à `0.0 dB` lors des événements de cycle de vie (`reset`, `initialize`, `set_processing(false)`, `set_active(false)`, `stop_processing`, `deactivate`).
 - **Fonction Gain Match Automatique (`006-gain-match`) :**
   - Ajout du paramètre DAW rétrocompatible `gain_match` (`OFF` par défaut) et d'un étage de compensation stéréo lié en toute fin de chaîne (post-Compression, post-Drum Bus EQ, post-Output Clipper et post-Mix parallèle, juste avant le safety clamp).
   - Mesure feed-forward par double enveloppe RMS appariée (`400 ms`) entre l'entrée brute (avant `Input Trim`) et le signal post-traitement, avec lissage doux (`150 ms` actif, `35 ms` au retour sur `OFF`), bornage `[-24.0, +24.0]` dB et détecteur de présence (`50 ms` à `-60 dBFS`) figeant (`Hold`) la compensation sur les silences pour préserver les transitoires et éviter l'amplification du bruit de fond.
@@ -20,6 +23,10 @@ Toutes les modifications notables de ce projet sont documentées dans ce fichier
 - **Renommage des bundles en `Omore Punch` et alignement fabricant (`005-plugin-bundle-metadata`) :**
   - Passage de `OmorePunch::VENDOR` et `Cargo.toml` (`authors`) à `Omore` (aligné avec *Omore Sampler*), tout en conservant strictement inchangés `VST3_CLASS_ID`, `CLAP_ID` et tous les identifiants de paramètres pour une rétrocompatibilité totale des projets DAW existants.
   - Renommage des bundles générés en `Omore Punch.vst3` et `Omore Punch.clap` via `bundler.toml`, mise à jour des artefacts CI (`.github/workflows/build.yml`) et nettoyage automatique des anciens bundles `omore-punch.*` dans `build.sh` et `build.ps1`.
+
+### Supprimé
+- **Retrait du paramètre DAW `gr_meter_db` (`007-gain-reduction-metering`) :**
+  - Suppression complète du paramètre exposé `gr_meter_db` (`Gain Reduction (dB)`) de `OmorePunchParams` et de sa synchronisation depuis l'interface `egui`, évitant toute entrée superflue dans les listes de paramètres et pistes d'automation DAW maintenant que les extensions de metering GR natives VST3/CLAP sont en place.
 
 ## [0.3.0] - 2026-11-14
 ### Ajouté
