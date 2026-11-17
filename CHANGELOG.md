@@ -4,6 +4,9 @@ Toutes les modifications notables de ce projet sont documentées dans ce fichier
 
 ## [Unreleased]
 ### Ajouté
+- **Support complet des presets utilisateur Reaper (`008-reaper-presets`) :**
+  - Implémentation de `Plugin::filter_state` (`sanitize_plugin_state`) pour garantir la rétrocompatibilité à 100 % des projets et presets antérieurs (remplissage des paramètres absents par leurs valeurs par défaut, bornage strict des flottants hors limites ou non finis, normalisation des enums et nettoyage des clés obsolètes/`editor-state`).
+  - Resynchronisation explicite de Reaper après chaque chargement de preset ou d'état en **CLAP** (`clap_host_params::rescan(CLAP_PARAM_RESCAN_VALUES)`) et en **VST3** (`IComponentHandler::restart_component(RestartFlags::kParamValuesChanged)`), accompagnée de la remise à zéro automatique de `Max GR` et du témoin `CLIP` même lorsque le plugin est inactif.
 - **Bouton Bypass Global (`008-bypass-button`) :**
   - Ajout du paramètre DAW officiel `bypass` (`OFF` par défaut, via `BoolParam::make_bypass()`), exposé en **VST3** (`kIsBypass`) et **CLAP** (`CLAP_PARAM_IS_BYPASS`), automatisable, rétrocompatible et synchronisé de manière bidirectionnelle avec le bouton Bypass natif de Reaper.
   - Implémentation dans `StereoPunchDsp` d'un *soft bypass* sans clic par rampe linéaire précalculée de `10 ms` avec transparence bit-exacte en bypass établi sous protection `sanitize_sample()`, gel de la correction et des accumulateurs du `Gain Match` pendant le contournement, remise à `0.0 dB` de la réduction de gain instantanée (UI et hôte DAW), absence de faux déclenchement de clip, et conservation des valeurs mémorisées (`Max GR`, `Peak GR Hold`, `[CLIP: ACTIVE]`) pour la comparaison A/B.
