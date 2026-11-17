@@ -25,6 +25,7 @@ const GAIN_MATCH_TOGGLE_SLEW_MS: f32 = 35.0;
 const GAIN_MATCH_NOISE_FLOOR_POWER: f32 = 1.0e-6;
 const GAIN_MATCH_MIN_DB: f32 = -24.0;
 const GAIN_MATCH_MAX_DB: f32 = 24.0;
+const BYPASS_RAMP_MS: f32 = 10.0;
 
 // ----------------------------------------------------------------------------
 // Helper Functions for Lock-Free Atomic f32 Storage
@@ -212,6 +213,7 @@ pub struct DspConfig {
     pub ceiling_db: f32,
     pub mix_pct: f32,
     pub gain_match: bool,
+    pub bypass: bool,
 }
 
 impl Default for DspConfig {
@@ -233,6 +235,7 @@ impl Default for DspConfig {
             ceiling_db: 0.0,
             mix_pct: 100.0,
             gain_match: false,
+            bypass: false,
         }
     }
 }
@@ -280,6 +283,8 @@ pub struct StereoPunchDsp {
     pub gm_gain_db: f32,
     auto_slow_gr_db: f32,
     pub env_gr_db: f32,
+    bypass_wet: f32,
+    bypass_step: f32,
 }
 
 impl Default for StereoPunchDsp {
@@ -317,11 +322,14 @@ impl Default for StereoPunchDsp {
             gm_gain_db: 0.0,
             auto_slow_gr_db: 0.0,
             env_gr_db: 0.0,
+            bypass_wet: 1.0,
+            bypass_step: 0.0,
         };
         dsp.update_ballistics(48000.0, 3.0, 80.0, ReleaseMode::Manual);
         dsp.update_sidechain_hpf(48000.0, 20.0);
         dsp.update_eq(48000.0, 20.0, 0.0, 0.0);
         dsp.update_gain_match_coeffs(48000.0);
+        dsp.update_bypass_coeff(48000.0);
         dsp
     }
 }
@@ -349,13 +357,16 @@ impl StereoPunchDsp {
     }
 
     #[inline(always)]
-    pub fn reset(&mut self) {
+    fn update_bypass_coeff(&mut self, sample_rate: f32) {
+        let sr = sample_rate.max(8000.0);
+        let ramp_samples = (BYPASS_RAMP_MS * 0.001 * sr).max(1.0);
+        self.bypass_step = 1.0 / ramp_samples;
+    }
+
+    #[inline(always)]
+    fn reset_transient_processing_state(&mut self) {
         self.env_gr_db = 0.0;
         self.auto_slow_gr_db = 0.0;
-        self.gm_in_ms = 0.0;
-        self.gm_post_ms = 0.0;
-        self.gm_presence_ms = 0.0;
-        self.gm_gain_db = 0.0;
         self.sc_prev_in_l = 0.0;
         self.sc_prev_in_r = 0.0;
         self.sc_prev_out_l = 0.0;
@@ -363,6 +374,24 @@ impl StereoPunchDsp {
         self.eq_low_cut.reset();
         self.eq_mid_cut.reset();
         self.eq_high_shelf.reset();
+    }
+
+    #[inline(always)]
+    pub fn sync_bypass_state(&mut self, bypass: bool) {
+        self.bypass_wet = if bypass { 0.0 } else { 1.0 };
+        if bypass {
+            self.reset_transient_processing_state();
+        }
+    }
+
+    #[inline(always)]
+    pub fn reset(&mut self) {
+        self.reset_transient_processing_state();
+        self.gm_in_ms = 0.0;
+        self.gm_post_ms = 0.0;
+        self.gm_presence_ms = 0.0;
+        self.gm_gain_db = 0.0;
+        self.bypass_wet = 1.0;
     }
 
     #[inline(always)]
@@ -396,6 +425,7 @@ impl StereoPunchDsp {
             self.update_sidechain_hpf(sr, hpf);
             self.update_eq(sr, eq_lc, eq_mc, eq_hs);
             self.update_gain_match_coeffs(sr);
+            self.update_bypass_coeff(sr);
         }
     }
 
@@ -420,6 +450,7 @@ impl StereoPunchDsp {
             self.cached_eq_mid_cut_db = -999.0;
             self.cached_eq_high_shelf_db = -999.0;
             self.update_gain_match_coeffs(sr);
+            self.update_bypass_coeff(sr);
         }
 
         if sr_changed || att_changed {
@@ -653,6 +684,29 @@ impl StereoPunchDsp {
         let dry_l = sanitize_sample(raw_l);
         let dry_r = sanitize_sample(raw_r);
 
+        // Advance linear soft-bypass ramp (10 ms) with finite guard
+        if !self.bypass_wet.is_finite() {
+            self.bypass_wet = if cfg.bypass { 0.0 } else { 1.0 };
+        }
+        let target_wet = if cfg.bypass { 0.0 } else { 1.0 };
+        if self.bypass_wet < target_wet {
+            self.bypass_wet = (self.bypass_wet + self.bypass_step).min(1.0);
+        } else if self.bypass_wet > target_wet {
+            self.bypass_wet = (self.bypass_wet - self.bypass_step).max(0.0);
+        }
+
+        // Settled bypass: bit-transparent sanitized passthrough; keep Gain Match state frozen
+        if cfg.bypass && self.bypass_wet <= 0.0 {
+            self.reset_transient_processing_state();
+            return SampleOutput {
+                out_l: dry_l,
+                out_r: dry_r,
+                gr_db: 0.0,
+                clipped: false,
+                gain_match_db: self.gm_gain_db,
+            };
+        }
+
         // Update envelope, sidechain filter and EQ coefficients only if parameters changed
         self.update_ballistics(
             self.sample_rate,
@@ -795,75 +849,92 @@ impl StereoPunchDsp {
         };
 
         // 8. Post-Processing Gain Match (Feed-Forward Stereo-Linked RMS)
-        let in_sq = 0.5 * (dry_l * dry_l + dry_r * dry_r);
-        let post_sq = 0.5 * (mixed_l * mixed_l + mixed_r * mixed_r);
+        // While ramping into bypass, freeze RMS accumulators and trim for seamless A/B return
+        if !cfg.bypass {
+            let in_sq = 0.5 * (dry_l * dry_l + dry_r * dry_r);
+            let post_sq = 0.5 * (mixed_l * mixed_l + mixed_r * mixed_r);
 
-        // Fast presence detector freezes (Hold) RMS & trim below -60 dBFS
-        let next_presence =
-            self.gm_presence_coeff * self.gm_presence_ms + (1.0 - self.gm_presence_coeff) * in_sq;
-        self.gm_presence_ms = if next_presence.is_finite() && next_presence > 1.0e-20 {
-            next_presence
-        } else {
-            0.0
-        };
-
-        if self.gm_presence_ms >= GAIN_MATCH_NOISE_FLOOR_POWER {
-            let next_in_ms =
-                self.gm_rms_coeff * self.gm_in_ms + (1.0 - self.gm_rms_coeff) * in_sq;
-            let next_post_ms =
-                self.gm_rms_coeff * self.gm_post_ms + (1.0 - self.gm_rms_coeff) * post_sq;
-
-            self.gm_in_ms = if next_in_ms.is_finite() && next_in_ms > 1.0e-20 {
-                next_in_ms
-            } else {
-                0.0
-            };
-            self.gm_post_ms = if next_post_ms.is_finite() && next_post_ms > 1.0e-20 {
-                next_post_ms
+            // Fast presence detector freezes (Hold) RMS & trim below -60 dBFS
+            let next_presence = self.gm_presence_coeff * self.gm_presence_ms
+                + (1.0 - self.gm_presence_coeff) * in_sq;
+            self.gm_presence_ms = if next_presence.is_finite() && next_presence > 1.0e-20 {
+                next_presence
             } else {
                 0.0
             };
 
-            if cfg.gain_match {
-                let ratio_power =
-                    self.gm_in_ms.max(1.0e-12) / self.gm_post_ms.max(1.0e-12);
-                let target_db = (10.0 * ratio_power.log10())
-                    .clamp(GAIN_MATCH_MIN_DB, GAIN_MATCH_MAX_DB);
-                self.gm_gain_db =
-                    self.gm_slew_coeff * self.gm_gain_db + (1.0 - self.gm_slew_coeff) * target_db;
+            if self.gm_presence_ms >= GAIN_MATCH_NOISE_FLOOR_POWER {
+                let next_in_ms =
+                    self.gm_rms_coeff * self.gm_in_ms + (1.0 - self.gm_rms_coeff) * in_sq;
+                let next_post_ms =
+                    self.gm_rms_coeff * self.gm_post_ms + (1.0 - self.gm_rms_coeff) * post_sq;
+
+                self.gm_in_ms = if next_in_ms.is_finite() && next_in_ms > 1.0e-20 {
+                    next_in_ms
+                } else {
+                    0.0
+                };
+                self.gm_post_ms = if next_post_ms.is_finite() && next_post_ms > 1.0e-20 {
+                    next_post_ms
+                } else {
+                    0.0
+                };
+
+                if cfg.gain_match {
+                    let ratio_power =
+                        self.gm_in_ms.max(1.0e-12) / self.gm_post_ms.max(1.0e-12);
+                    let target_db = (10.0 * ratio_power.log10())
+                        .clamp(GAIN_MATCH_MIN_DB, GAIN_MATCH_MAX_DB);
+                    self.gm_gain_db = self.gm_slew_coeff * self.gm_gain_db
+                        + (1.0 - self.gm_slew_coeff) * target_db;
+                }
             }
-        }
 
-        if !cfg.gain_match {
-            self.gm_gain_db *= self.gm_off_slew_coeff;
-            if !self.gm_gain_db.is_finite() || self.gm_gain_db.abs() < 1.0e-5 {
+            if !cfg.gain_match {
+                self.gm_gain_db *= self.gm_off_slew_coeff;
+                if !self.gm_gain_db.is_finite() || self.gm_gain_db.abs() < 1.0e-5 {
+                    self.gm_gain_db = 0.0;
+                }
+            } else if !self.gm_gain_db.is_finite() || self.gm_gain_db.abs() < 1.0e-20 {
                 self.gm_gain_db = 0.0;
+            } else {
+                self.gm_gain_db = self.gm_gain_db.clamp(GAIN_MATCH_MIN_DB, GAIN_MATCH_MAX_DB);
             }
-        } else if !self.gm_gain_db.is_finite() || self.gm_gain_db.abs() < 1.0e-20 {
-            self.gm_gain_db = 0.0;
-        } else {
-            self.gm_gain_db = self.gm_gain_db.clamp(GAIN_MATCH_MIN_DB, GAIN_MATCH_MAX_DB);
         }
 
-        let (matched_l, matched_r, gain_match_clipped) = if self.gm_gain_db != 0.0 {
-            let gm_lin = db_to_lin(self.gm_gain_db);
-            let ml = mixed_l * gm_lin;
-            let mr = mixed_r * gm_lin;
-            let over = cfg.gain_match && (ml.abs() > 1.0 || mr.abs() > 1.0);
-            (ml, mr, over)
-        } else {
-            (mixed_l, mixed_r, false)
-        };
+        let (matched_l, matched_r, gain_match_clipped) =
+            if self.gm_gain_db.is_finite() && self.gm_gain_db != 0.0 {
+                let gm_lin = db_to_lin(self.gm_gain_db);
+                let ml = mixed_l * gm_lin;
+                let mr = mixed_r * gm_lin;
+                let over = !cfg.bypass && cfg.gain_match && (ml.abs() > 1.0 || mr.abs() > 1.0);
+                (ml, mr, over)
+            } else {
+                (mixed_l, mixed_r, false)
+            };
 
-        // Final Safety Sanitization & Clamp [-4.0, 4.0]
-        let out_l = sanitize_sample(matched_l);
-        let out_r = sanitize_sample(matched_r);
+        // 9. Soft-Bypass Crossfade + Final Safety Sanitization & Clamp [-4.0, 4.0]
+        let (final_l, final_r) = if self.bypass_wet >= 1.0 {
+            (matched_l, matched_r)
+        } else {
+            let dry_weight = 1.0 - self.bypass_wet;
+            (
+                dry_l * dry_weight + matched_l * self.bypass_wet,
+                dry_r * dry_weight + matched_r * self.bypass_wet,
+            )
+        };
+        let out_l = sanitize_sample(final_l);
+        let out_r = sanitize_sample(final_r);
 
         SampleOutput {
             out_l,
             out_r,
-            gr_db: self.env_gr_db,
-            clipped: clipped || gain_match_clipped,
+            gr_db: if cfg.bypass { 0.0 } else { self.env_gr_db },
+            clipped: if cfg.bypass {
+                false
+            } else {
+                clipped || gain_match_clipped
+            },
             gain_match_db: self.gm_gain_db,
         }
     }
@@ -967,6 +1038,9 @@ pub struct OmorePunchParams {
 
     #[id = "gain_match"]
     pub gain_match: BoolParam,
+
+    #[id = "bypass"]
+    pub bypass: BoolParam,
 }
 
 /// Builds the `Release` parameter with a configurable default so tests can exercise wide readouts.
@@ -1133,6 +1207,8 @@ impl Default for OmorePunchParams {
             .with_value_to_string(formatters::v2s_f32_rounded(1)),
 
             gain_match: BoolParam::new("Gain Match", false),
+
+            bypass: BoolParam::new("Bypass", false).make_bypass(),
         }
     }
 }
@@ -1150,6 +1226,17 @@ fn take_last_created_telemetry() -> Option<Arc<MeterTelemetry>> {
     LAST_CREATED_TELEMETRY.with(|slot| slot.borrow_mut().take())
 }
 
+#[cfg(test)]
+thread_local! {
+    static LAST_INSPECTABLE_TELEMETRY: std::cell::RefCell<Option<Arc<MeterTelemetry>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn take_last_inspectable_telemetry() -> Option<Arc<MeterTelemetry>> {
+    LAST_INSPECTABLE_TELEMETRY.with(|slot| slot.borrow_mut().take())
+}
+
 pub struct OmorePunch {
     params: Arc<OmorePunchParams>,
     editor_state: Arc<EguiState>,
@@ -1161,6 +1248,10 @@ impl Default for OmorePunch {
     fn default() -> Self {
         let telemetry = Arc::new(MeterTelemetry::default());
         LAST_CREATED_TELEMETRY.with(|slot| {
+            *slot.borrow_mut() = Some(telemetry.clone());
+        });
+        #[cfg(test)]
+        LAST_INSPECTABLE_TELEMETRY.with(|slot| {
             *slot.borrow_mut() = Some(telemetry.clone());
         });
         Self {
@@ -1215,6 +1306,7 @@ impl Plugin for OmorePunch {
     ) -> bool {
         self.dsp.set_sample_rate(buffer_config.sample_rate);
         self.dsp.reset();
+        self.dsp.sync_bypass_state(self.params.bypass.value());
         self.telemetry.clear_gain_reduction();
         self.telemetry.reset_peaks();
         true
@@ -1222,6 +1314,7 @@ impl Plugin for OmorePunch {
 
     fn reset(&mut self) {
         self.dsp.reset();
+        self.dsp.sync_bypass_state(self.params.bypass.value());
         self.telemetry.clear_gain_reduction();
     }
 
@@ -1251,15 +1344,23 @@ impl Plugin for OmorePunch {
         let mut block_out_r = 0.0_f32;
         let mut block_max_gr = 0.0_f32;
         let mut block_clipped = false;
+        let mut block_active = false;
 
         let auto_makeup = self.params.auto_makeup.value();
         let release_mode = self.params.release_mode.value();
         let clipper_mode = self.params.clipper_mode.value();
         let gain_match = self.params.gain_match.value();
+        let mut last_bypass = self.params.bypass.value();
 
         for mut channel_samples in buffer.iter_samples() {
             if channel_samples.len() < 2 {
                 continue;
+            }
+
+            let bypass = self.params.bypass.value();
+            last_bypass = bypass;
+            if !bypass {
+                block_active = true;
             }
 
             let cfg = DspConfig {
@@ -1279,6 +1380,7 @@ impl Plugin for OmorePunch {
                 ceiling_db: self.params.ceiling_db.smoothed.next(),
                 mix_pct: self.params.mix_pct.smoothed.next(),
                 gain_match,
+                bypass,
             };
 
             let raw_l = *channel_samples.get_mut(0).unwrap();
@@ -1297,9 +1399,11 @@ impl Plugin for OmorePunch {
 
             block_out_l = block_out_l.max(out.out_l.abs());
             block_out_r = block_out_r.max(out.out_r.abs());
-            block_max_gr = block_max_gr.max(out.gr_db);
-            if out.clipped {
-                block_clipped = true;
+            if !bypass {
+                block_max_gr = block_max_gr.max(out.gr_db);
+                if out.clipped {
+                    block_clipped = true;
+                }
             }
         }
 
@@ -1313,7 +1417,12 @@ impl Plugin for OmorePunch {
         store_f32_relaxed(&self.telemetry.in_peak_r, block_in_r.max(prev_in_r));
         store_f32_relaxed(&self.telemetry.out_peak_l, block_out_l.max(prev_out_l));
         store_f32_relaxed(&self.telemetry.out_peak_r, block_out_r.max(prev_out_r));
-        store_f32_relaxed(&self.telemetry.current_gr_db, self.dsp.env_gr_db);
+        let reported_gr = if block_active && !last_bypass {
+            self.dsp.env_gr_db
+        } else {
+            0.0
+        };
+        store_f32_relaxed(&self.telemetry.current_gr_db, reported_gr);
         store_f32_relaxed(&self.telemetry.gain_match_db, self.dsp.gm_gain_db);
 
         let held_max_gr = load_f32_relaxed(&self.telemetry.max_gr_db);
@@ -1333,11 +1442,11 @@ impl Plugin for OmorePunch {
 // EGUI User Interface (Dark Omore Style - 100% ASCII)
 // ----------------------------------------------------------------------------
 
-const UI_WINDOW_WIDTH: u32 = 820;
+const UI_WINDOW_WIDTH: u32 = 900;
 const UI_WINDOW_HEIGHT: u32 = 650;
-const UI_LEFT_COL_WIDTH: f32 = 480.0;
-const UI_RIGHT_COL_WIDTH: f32 = 310.0;
-const UI_COL_GAP: f32 = 10.0;
+const UI_LEFT_COL_WIDTH: f32 = 510.0;
+const UI_RIGHT_COL_WIDTH: f32 = 352.0;
+const UI_COL_GAP: f32 = 14.0;
 const UI_KNOB_COLS_MAX: usize = 4;
 const UI_KNOB_CELL_WIDTH: f32 = 110.0;
 const UI_KNOB_CELL_HEIGHT: f32 = 94.0;
@@ -1798,25 +1907,28 @@ fn format_dev_badge_label(git_tag: &str) -> String {
 
 fn draw_header_bar(
     egui_ctx: &egui::Context,
+    setter: &ParamSetter,
+    params: &OmorePunchParams,
     telemetry: &MeterTelemetry,
     raw_version: &str,
     git_tag: &str,
 ) {
     let is_clipped = telemetry.clip_latched.load(Ordering::Relaxed);
+    let is_bypassed = params.bypass.value();
     let (base_version, is_dev) = parse_display_version(raw_version);
     let header_amber = egui::Color32::from_rgb(245, 185, 35);
     let header_text = |text: String| {
         egui::RichText::new(text)
             .monospace()
             .strong()
-            .size(13.5)
+            .size(12.0)
             .color(header_amber)
     };
 
     egui::TopBottomPanel::top("omore_punch_header").show(egui_ctx, |ui| {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 5.0;
+            ui.spacing_mut().item_spacing.x = 4.0;
 
             if is_dev {
                 ui.label(header_text(format!("OMORE PUNCH v{}", base_version)));
@@ -1827,13 +1939,13 @@ fn draw_header_bar(
                         egui::Color32::from_rgb(70, 155, 220),
                     ))
                     .corner_radius(3.0)
-                    .inner_margin(egui::Margin::symmetric(5, 1))
+                    .inner_margin(egui::Margin::symmetric(4, 1))
                     .show(ui, |ui| {
                         ui.label(
                             egui::RichText::new(format_dev_badge_label(git_tag))
                                 .monospace()
                                 .strong()
-                                .size(11.5)
+                                .size(10.5)
                                 .color(egui::Color32::from_rgb(235, 248, 255)),
                         );
                     });
@@ -1848,6 +1960,9 @@ fn draw_header_bar(
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().button_padding = egui::vec2(5.0, 2.0);
+
                 let clip_text = if is_clipped {
                     "[CLIP: ACTIVE - CLICK TO RESET]"
                 } else {
@@ -1864,7 +1979,7 @@ fn draw_header_bar(
                             egui::RichText::new(clip_text)
                                 .monospace()
                                 .strong()
-                                .size(12.5)
+                                .size(11.0)
                                 .color(egui::Color32::WHITE),
                         )
                         .fill(clip_color),
@@ -1872,6 +1987,41 @@ fn draw_header_bar(
                     .clicked()
                 {
                     telemetry.clip_latched.store(false, Ordering::Relaxed);
+                }
+
+                let (bypass_text, bypass_fill, bypass_text_color, bypass_stroke) = if is_bypassed {
+                    (
+                        "[BYPASS: ON]",
+                        egui::Color32::from_rgb(230, 150, 25),
+                        egui::Color32::from_rgb(16, 17, 22),
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(255, 220, 105)),
+                    )
+                } else {
+                    (
+                        "[BYPASS: OFF]",
+                        egui::Color32::from_rgb(40, 44, 54),
+                        egui::Color32::from_rgb(215, 220, 230),
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(72, 78, 94)),
+                    )
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(bypass_text)
+                                .monospace()
+                                .strong()
+                                .size(11.0)
+                                .color(bypass_text_color),
+                        )
+                        .fill(bypass_fill)
+                        .stroke(bypass_stroke),
+                    )
+                    .on_hover_text("Soft-bypass all audio processing for A/B comparison")
+                    .clicked()
+                {
+                    setter.begin_set_parameter(&params.bypass);
+                    setter.set_parameter(&params.bypass, !is_bypassed);
+                    setter.end_set_parameter(&params.bypass);
                 }
             });
         });
@@ -1887,6 +2037,7 @@ fn draw_omore_punch_ui(
 ) {
     apply_omore_dark_theme(egui_ctx);
 
+    let is_bypassed = params.bypass.value();
     let in_l = load_f32_relaxed(&telemetry.in_peak_l);
     let in_r = load_f32_relaxed(&telemetry.in_peak_r);
     let out_l = load_f32_relaxed(&telemetry.out_peak_l);
@@ -1903,6 +2054,8 @@ fn draw_omore_punch_ui(
 
     draw_header_bar(
         egui_ctx,
+        setter,
+        params,
         telemetry,
         env!("CARGO_PKG_VERSION"),
         option_env!("OMORE_GIT_TAG").unwrap_or(""),
@@ -1924,6 +2077,9 @@ fn draw_omore_punch_ui(
                 egui::Layout::top_down(egui::Align::Min),
                 |left_col| {
                     left_col.set_width(UI_LEFT_COL_WIDTH);
+                    if is_bypassed {
+                        left_col.set_opacity(0.55);
+                    }
 
                     left_col.group(|ui| {
                         ui.set_width(ui.available_width());
@@ -2326,52 +2482,57 @@ fn draw_omore_punch_ui(
                         });
 
                         ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            let gain_match_on = params.gain_match.value();
-                            let gm_label = if gain_match_on {
-                                "[Gain Match: ON]"
-                            } else {
-                                "[Gain Match: OFF]"
-                            };
-                            let gm_fill = if gain_match_on {
-                                egui::Color32::from_rgb(195, 125, 20)
-                            } else {
-                                egui::Color32::from_rgb(45, 48, 58)
-                            };
-                            if ui
-                                .add_sized(
-                                    [158.0, 24.0],
-                                    egui::Button::new(
-                                        egui::RichText::new(gm_label).monospace().strong(),
-                                    )
-                                    .fill(gm_fill),
-                                )
-                                .on_hover_text(
-                                    "Match post-processing output RMS volume to raw input level",
-                                )
-                                .clicked()
-                            {
-                                setter.begin_set_parameter(&params.gain_match);
-                                setter.set_parameter(&params.gain_match, !gain_match_on);
-                                setter.end_set_parameter(&params.gain_match);
+                        ui.scope(|ui| {
+                            if is_bypassed {
+                                ui.set_opacity(0.55);
                             }
+                            ui.horizontal(|ui| {
+                                let gain_match_on = params.gain_match.value();
+                                let gm_label = if gain_match_on {
+                                    "[Gain Match: ON]"
+                                } else {
+                                    "[Gain Match: OFF]"
+                                };
+                                let gm_fill = if gain_match_on {
+                                    egui::Color32::from_rgb(195, 125, 20)
+                                } else {
+                                    egui::Color32::from_rgb(45, 48, 58)
+                                };
+                                if ui
+                                    .add_sized(
+                                        [158.0, 24.0],
+                                        egui::Button::new(
+                                            egui::RichText::new(gm_label).monospace().strong(),
+                                        )
+                                        .fill(gm_fill),
+                                    )
+                                    .on_hover_text(
+                                        "Match post-processing output RMS volume to raw input level",
+                                    )
+                                    .clicked()
+                                {
+                                    setter.begin_set_parameter(&params.gain_match);
+                                    setter.set_parameter(&params.gain_match, !gain_match_on);
+                                    setter.end_set_parameter(&params.gain_match);
+                                }
 
-                            ui.add_space(6.0);
-                            let trim_color = if gain_match_on {
-                                egui::Color32::from_rgb(245, 185, 35)
-                            } else {
-                                egui::Color32::from_rgb(145, 150, 162)
-                            };
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Trim: {:+.1} dB",
-                                    gain_match_db_display
-                                ))
-                                .monospace()
-                                .strong()
-                                .size(13.5)
-                                .color(trim_color),
-                            );
+                                ui.add_space(6.0);
+                                let trim_color = if gain_match_on {
+                                    egui::Color32::from_rgb(245, 185, 35)
+                                } else {
+                                    egui::Color32::from_rgb(145, 150, 162)
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Trim: {:+.1} dB",
+                                        gain_match_db_display
+                                    ))
+                                    .monospace()
+                                    .strong()
+                                    .size(13.5)
+                                    .color(trim_color),
+                                );
+                            });
                         });
 
                         ui.add_space(6.0);
@@ -3200,6 +3361,7 @@ mod tests {
             ceiling_db: 0.0,
             mix_pct: 100.0,
             gain_match: false,
+            bypass: false,
         };
 
         // Left channel is at 0.5 (-6.0206 dBFS), Right channel is at 0.1 (-20.0 dBFS).
@@ -3264,6 +3426,7 @@ mod tests {
             ceiling_db: 0.0,
             mix_pct: 100.0,
             gain_match: false,
+            bypass: false,
         };
 
         let cfg_filtered = DspConfig {
@@ -3332,6 +3495,7 @@ mod tests {
             ceiling_db: 0.0,
             mix_pct: 100.0,
             gain_match: false,
+            bypass: false,
         };
 
         let cfg_snare_safe = DspConfig {
@@ -3399,6 +3563,7 @@ mod tests {
                 ceiling_db,
                 mix_pct: 100.0,
                 gain_match: false,
+                bypass: false,
             };
 
             let out = dsp.process_sample(1.2, -1.8, &cfg);
@@ -3459,6 +3624,7 @@ mod tests {
             ceiling_db: -4.0,
             mix_pct: 0.0,
             gain_match: false,
+            bypass: false,
         };
         let out_zero = dsp_dry.process_sample(dry_l, dry_r, &cfg_zero_mix);
         assert_eq!(
@@ -3537,6 +3703,7 @@ mod tests {
                     ceiling_db: 0.0,
                     mix_pct: 100.0,
                     gain_match,
+                    bypass: false,
                 };
 
                 for (in_l, in_r) in pathological_inputs {
@@ -4170,6 +4337,203 @@ mod tests {
             ..OmorePunchParams::default()
         };
         assert_ui_fits("gain_match_on_extreme", Arc::new(gain_match_params), -24.0);
+
+        let bypass_params = OmorePunchParams {
+            bypass: BoolParam::new("Bypass", true).make_bypass(),
+            gain_match: BoolParam::new("Gain Match", true),
+            ..OmorePunchParams::default()
+        };
+        assert_ui_fits("bypass_on_with_gain_match", Arc::new(bypass_params), -12.0);
+    }
+
+    #[test]
+    fn test_ui_bypass_button_and_controls_remain_editable() {
+        use std::sync::Mutex;
+
+        fn find_text_rect(shape: &egui::epaint::Shape, needle: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::epaint::Shape::Text(text_shape) => {
+                    if text_shape.galley.text().contains(needle) {
+                        Some(text_shape.visual_bounding_rect())
+                    } else {
+                        None
+                    }
+                }
+                egui::epaint::Shape::Vec(items) => {
+                    items.iter().find_map(|item| find_text_rect(item, needle))
+                }
+                _ => None,
+            }
+        }
+
+        struct TrackingGuiContext {
+            calls: Mutex<Vec<(ParamPtr, f32)>>,
+        }
+        impl GuiContext for TrackingGuiContext {
+            fn plugin_api(&self) -> PluginApi {
+                PluginApi::Standalone
+            }
+            fn request_resize(&self) -> bool {
+                false
+            }
+            unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
+            unsafe fn raw_set_parameter_normalized(&self, param: ParamPtr, normalized: f32) {
+                self.calls.lock().unwrap().push((param, normalized));
+            }
+            unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
+            fn get_state(&self) -> PluginState {
+                PluginState {
+                    version: String::new(),
+                    params: std::collections::BTreeMap::new(),
+                    fields: std::collections::BTreeMap::new(),
+                }
+            }
+            fn set_state(&self, _state: PluginState) {}
+        }
+
+        let telemetry = Arc::new(MeterTelemetry::default());
+        let base_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(UI_WINDOW_WIDTH as f32, UI_WINDOW_HEIGHT as f32),
+            )),
+            ..Default::default()
+        };
+
+        // Phase A: bypass=false -> clicking [BYPASS: OFF] invokes setter for params.bypass -> true
+        let params_off = Arc::new(OmorePunchParams::default());
+        let gui_off = TrackingGuiContext {
+            calls: Mutex::new(Vec::new()),
+        };
+        let setter_off = ParamSetter::new(&gui_off);
+        let ctx_off = egui::Context::default();
+        let render_off = |events: Vec<egui::Event>| {
+            let mut input = base_input.clone();
+            input.events = events;
+            ctx_off.run(input, |ctx| {
+                draw_omore_punch_ui(ctx, &setter_off, &params_off, &telemetry);
+            })
+        };
+
+        let _ = render_off(vec![]);
+        let out_off = render_off(vec![]);
+        let bypass_pos = out_off
+            .shapes
+            .iter()
+            .find_map(|c| find_text_rect(&c.shape, "[BYPASS: OFF]"))
+            .expect("[BYPASS: OFF] button must be painted in header")
+            .center();
+
+        let _ = render_off(vec![
+            egui::Event::PointerMoved(bypass_pos),
+            egui::Event::PointerButton {
+                pos: bypass_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let _ = render_off(vec![egui::Event::PointerButton {
+            pos: bypass_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let off_calls = gui_off.calls.lock().unwrap();
+        assert!(
+            off_calls
+                .iter()
+                .any(|&(ptr, norm)| ptr == params_off.bypass.as_ptr() && norm >= 0.5),
+            "Clicking [BYPASS: OFF] must set bypass=true, got {:?}",
+            *off_calls
+        );
+
+        // Phase B: bypass=true -> [BYPASS: ON] shown, controls remain editable under opacity 0.55
+        let params_on = Arc::new(OmorePunchParams {
+            bypass: BoolParam::new("Bypass", true).make_bypass(),
+            ..OmorePunchParams::default()
+        });
+        let gui_on = TrackingGuiContext {
+            calls: Mutex::new(Vec::new()),
+        };
+        let setter_on = ParamSetter::new(&gui_on);
+        let ctx_on = egui::Context::default();
+        let render_on = |events: Vec<egui::Event>| {
+            let mut input = base_input.clone();
+            input.events = events;
+            ctx_on.run(input, |ctx| {
+                draw_omore_punch_ui(ctx, &setter_on, &params_on, &telemetry);
+            })
+        };
+
+        let _ = render_on(vec![]);
+        let out_on = render_on(vec![]);
+        assert!(
+            out_on
+                .shapes
+                .iter()
+                .any(|c| find_text_rect(&c.shape, "[BYPASS: ON]").is_some()),
+            "Header must show [BYPASS: ON] when bypass is enabled"
+        );
+
+        // Click [Hard Clip] in left column and [Gain Match: OFF] in right column while bypassed
+        let hard_clip_pos = out_on
+            .shapes
+            .iter()
+            .find_map(|c| find_text_rect(&c.shape, "[Hard Clip]"))
+            .expect("[Hard Clip] control must remain visible when bypassed")
+            .center();
+        let _ = render_on(vec![
+            egui::Event::PointerMoved(hard_clip_pos),
+            egui::Event::PointerButton {
+                pos: hard_clip_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let _ = render_on(vec![egui::Event::PointerButton {
+            pos: hard_clip_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+
+        let gm_pos = out_on
+            .shapes
+            .iter()
+            .find_map(|c| find_text_rect(&c.shape, "[Gain Match: OFF]"))
+            .expect("[Gain Match: OFF] button must remain visible when bypassed")
+            .center();
+        let _ = render_on(vec![
+            egui::Event::PointerMoved(gm_pos),
+            egui::Event::PointerButton {
+                pos: gm_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let _ = render_on(vec![egui::Event::PointerButton {
+            pos: gm_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+
+        let on_calls = gui_on.calls.lock().unwrap();
+        assert!(
+            on_calls
+                .iter()
+                .any(|&(ptr, _)| ptr == params_on.clipper_mode.as_ptr()),
+            "Left-column controls must remain editable under opacity 0.55 while bypassed"
+        );
+        assert!(
+            on_calls
+                .iter()
+                .any(|&(ptr, norm)| ptr == params_on.gain_match.as_ptr() && norm >= 0.5),
+            "Gain Match button must remain editable under opacity 0.55 while bypassed"
+        );
     }
 
     #[test]
@@ -4209,48 +4573,138 @@ mod tests {
     #[test]
     fn test_ui_header_fits_window_with_dev_badge() {
         // Empirical egui render of worst-case header:
-        // "[DEV 1d2c5b9-dirty]" on the left + "[CLIP: ACTIVE - CLICK TO RESET]" on the right
-        let ctx = egui::Context::default();
-        let telemetry = MeterTelemetry::default();
-        telemetry.clip_latched.store(true, Ordering::Relaxed);
-        let raw_input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(UI_WINDOW_WIDTH as f32, UI_WINDOW_HEIGHT as f32),
-            )),
-            ..Default::default()
-        };
-
-        let mut final_output = None;
-        for _ in 0..2 {
-            final_output = Some(ctx.run(raw_input.clone(), |ctx| {
-                apply_omore_dark_theme(ctx);
-                draw_header_bar(ctx, &telemetry, "0.2.1-dev", "1d2c5b9-dirty");
-                egui::CentralPanel::default().show(ctx, |_| {});
-            }));
+        // "[DEV 1d2c5b9-dirty]" on the left + "[BYPASS: OFF]" + "[CLIP: ACTIVE - CLICK TO RESET]" on the right
+        struct NoopGuiContext;
+        impl GuiContext for NoopGuiContext {
+            fn plugin_api(&self) -> PluginApi {
+                PluginApi::Standalone
+            }
+            fn request_resize(&self) -> bool {
+                false
+            }
+            unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
+            unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, _normalized: f32) {}
+            unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
+            fn get_state(&self) -> PluginState {
+                PluginState {
+                    version: String::new(),
+                    params: std::collections::BTreeMap::new(),
+                    fields: std::collections::BTreeMap::new(),
+                }
+            }
+            fn set_state(&self, _state: PluginState) {}
         }
-        let used = ctx.used_rect();
-        assert!(
-            used.width() <= UI_WINDOW_WIDTH as f32,
-            "Rendered egui width ({}) with [DEV 1d2c5b9-dirty] + latched clip exceeds window width ({})",
-            used.width(),
-            UI_WINDOW_WIDTH
-        );
-        let max_inner_right = final_output
-            .expect("egui frame output missing")
-            .shapes
-            .iter()
-            .filter_map(|clipped| {
-                let rect = clipped.shape.visual_bounding_rect();
-                (rect.width() < UI_WINDOW_WIDTH as f32 - 1.0).then_some(rect.right())
-            })
-            .fold(0.0_f32, f32::max);
-        assert!(
-            max_inner_right <= UI_WINDOW_WIDTH as f32 - 6.0,
-            "Inner widgets right ({}) with [DEV 1d2c5b9-dirty] + latched clip exceeds padded window width ({})",
-            max_inner_right,
-            UI_WINDOW_WIDTH as f32 - 6.0
-        );
+
+        fn find_text_rect_header(
+            shape: &egui::epaint::Shape,
+            needle: &str,
+        ) -> Option<egui::Rect> {
+            match shape {
+                egui::epaint::Shape::Text(text_shape) => {
+                    if text_shape.galley.text().contains(needle) {
+                        Some(text_shape.visual_bounding_rect())
+                    } else {
+                        None
+                    }
+                }
+                egui::epaint::Shape::Vec(items) => items
+                    .iter()
+                    .find_map(|item| find_text_rect_header(item, needle)),
+                _ => None,
+            }
+        }
+
+        for bypass_state in [false, true] {
+            let ctx = egui::Context::default();
+            let telemetry = MeterTelemetry::default();
+            telemetry.clip_latched.store(true, Ordering::Relaxed);
+            let params = OmorePunchParams {
+                bypass: BoolParam::new("Bypass", bypass_state).make_bypass(),
+                ..OmorePunchParams::default()
+            };
+            let noop_gui = NoopGuiContext;
+            let setter = ParamSetter::new(&noop_gui);
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(UI_WINDOW_WIDTH as f32, UI_WINDOW_HEIGHT as f32),
+                )),
+                ..Default::default()
+            };
+
+            let mut final_output = None;
+            for _ in 0..2 {
+                final_output = Some(ctx.run(raw_input.clone(), |ctx| {
+                    apply_omore_dark_theme(ctx);
+                    draw_header_bar(
+                        ctx,
+                        &setter,
+                        &params,
+                        &telemetry,
+                        "0.2.1-dev",
+                        "1d2c5b9-dirty",
+                    );
+                    egui::CentralPanel::default().show(ctx, |_| {});
+                }));
+            }
+            let used = ctx.used_rect();
+            assert!(
+                used.width() <= UI_WINDOW_WIDTH as f32,
+                "Rendered egui width ({}) with [DEV 1d2c5b9-dirty] + bypass + latched clip exceeds window width ({})",
+                used.width(),
+                UI_WINDOW_WIDTH
+            );
+            let shapes = final_output.expect("egui frame output missing").shapes;
+            let max_inner_right = shapes
+                .iter()
+                .filter_map(|clipped| {
+                    let rect = clipped.shape.visual_bounding_rect();
+                    (rect.width() < UI_WINDOW_WIDTH as f32 - 1.0).then_some(rect.right())
+                })
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_inner_right <= UI_WINDOW_WIDTH as f32 - 6.0,
+                "Inner widgets right ({}) with [DEV 1d2c5b9-dirty] + bypass + latched clip exceeds padded window width ({})",
+                max_inner_right,
+                UI_WINDOW_WIDTH as f32 - 6.0
+            );
+
+            // Preserve constitutional labels intact and ensure single-line non-overlapping header
+            let subtitle_rect = shapes
+                .iter()
+                .find_map(|c| find_text_rect_header(&c.shape, "STEREO DRUM BUS COMPRESSOR & CLIPPER"))
+                .expect("Constitutional header subtitle missing");
+            let clip_rect = shapes
+                .iter()
+                .find_map(|c| find_text_rect_header(&c.shape, "[CLIP: ACTIVE - CLICK TO RESET]"))
+                .expect("Constitutional clip reset button missing");
+            let bypass_label = if bypass_state {
+                "[BYPASS: ON]"
+            } else {
+                "[BYPASS: OFF]"
+            };
+            let bypass_rect = shapes
+                .iter()
+                .find_map(|c| find_text_rect_header(&c.shape, bypass_label))
+                .expect("Header bypass button missing");
+
+            assert!(
+                subtitle_rect.right() < bypass_rect.left(),
+                "Header left subtitle ({}) overlaps bypass button ({})",
+                subtitle_rect.right(),
+                bypass_rect.left()
+            );
+            assert!(
+                bypass_rect.right() < clip_rect.left(),
+                "Header bypass button ({}) overlaps clip button ({})",
+                bypass_rect.right(),
+                clip_rect.left()
+            );
+            assert!(
+                subtitle_rect.bottom().max(bypass_rect.bottom()).max(clip_rect.bottom()) <= 36.0,
+                "Header widgets wrapped unexpectedly onto multiple lines"
+            );
+        }
     }
 
     #[test]
@@ -4267,8 +4721,12 @@ mod tests {
             "Fixed-size editor_state must not be persisted in DAW params state"
         );
 
-        // Restoring a legacy DAW state (e.g. v0.2.0 820x560 or pre-EQ 820x480) must keep 820x620
-        for legacy_json in [r#"{"size":[820,560]}"#, r#"{"size":[820,480]}"#] {
+        // Restoring a legacy DAW state (e.g. v0.2.0 820x560 or v0.3.x 820x650) must keep current dimensions
+        for legacy_json in [
+            r#"{"size":[820,650]}"#,
+            r#"{"size":[820,560]}"#,
+            r#"{"size":[820,480]}"#,
+        ] {
             let mut legacy_fields = std::collections::BTreeMap::new();
             legacy_fields.insert("editor-state".to_string(), legacy_json.to_string());
             plugin.params.deserialize_fields(&legacy_fields);
@@ -5363,6 +5821,16 @@ mod tests {
         left: &[f32],
         right: &[f32],
     ) {
+        let _ = process_vst3_stereo_block_out(proc_if, left, right);
+    }
+
+    fn process_vst3_stereo_block_out(
+        proc_if: &nih_plug::wrapper::vst3::vst3_sys::VstPtr<
+            dyn nih_plug::wrapper::vst3::vst3_sys::vst::IAudioProcessor,
+        >,
+        left: &[f32],
+        right: &[f32],
+    ) -> (Vec<f32>, Vec<f32>) {
         use nih_plug::wrapper::vst3::vst3_sys::base::kResultOk;
         use nih_plug::wrapper::vst3::vst3_sys::vst::{
             AudioBusBuffers, IAudioProcessor, ProcessData, ProcessModes, SymbolicSampleSizes,
@@ -5408,6 +5876,8 @@ mod tests {
 
             assert_eq!(proc_if.process(&mut data), kResultOk);
         }
+
+        (out_l, out_r)
     }
 
     #[test]
@@ -5865,6 +6335,692 @@ mod tests {
                     0.0_f64.to_bits()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_bypass_transparency_and_safety_clamp() {
+        assert!(!DspConfig::default().bypass);
+
+        for sr in [44100.0_f32, 48000.0_f32, 96000.0_f32] {
+            let mut dsp = StereoPunchDsp::new(sr);
+            let mut cfg = DspConfig {
+                input_db: 6.0,
+                threshold_db: -24.0,
+                ratio: 8.0,
+                attack_ms: 1.0,
+                release_ms: 50.0,
+                auto_makeup: true,
+                makeup_db: 4.0,
+                eq_low_cut_hz: 120.0,
+                eq_mid_cut_db: -9.0,
+                eq_high_shelf_db: 9.0,
+                clipper_mode: ClipperMode::HardClip,
+                ceiling_db: -6.0,
+                mix_pct: 100.0,
+                gain_match: false,
+                bypass: false,
+                ..DspConfig::default()
+            };
+
+            // Warm up compressor and filters
+            for n in 0..2048 {
+                let phase = 2.0 * std::f32::consts::PI * 300.0 * (n as f32) / sr;
+                dsp.process_sample(0.6 * phase.sin(), -0.4 * phase.cos(), &cfg);
+            }
+
+            // Enable bypass and let ramp settle within <= 20 ms
+            cfg.bypass = true;
+            let settle_samples = ((0.020 * sr).ceil() as usize).max(1);
+            for n in 0..settle_samples {
+                let phase = 2.0 * std::f32::consts::PI * 300.0 * (n as f32) / sr;
+                dsp.process_sample(0.6 * phase.sin(), -0.4 * phase.cos(), &cfg);
+            }
+
+            // After ramp settles, bypass must be bit-exact within [-4.0, 4.0] (< -120 dBFS)
+            for n in 0..1024 {
+                let phase = 2.0 * std::f32::consts::PI * 440.0 * (n as f32) / sr;
+                let in_l = 0.65 * phase.sin();
+                let in_r = -0.35 * phase.cos();
+                let out = dsp.process_sample(in_l, in_r, &cfg);
+                assert_eq!(
+                    out.out_l.to_bits(),
+                    in_l.to_bits(),
+                    "sr={}: bypassed Left output must be bit-identical at sample {}",
+                    sr,
+                    n
+                );
+                assert_eq!(
+                    out.out_r.to_bits(),
+                    in_r.to_bits(),
+                    "sr={}: bypassed Right output must be bit-identical at sample {}",
+                    sr,
+                    n
+                );
+                assert_eq!(out.gr_db, 0.0);
+                assert!(!out.clipped);
+            }
+
+            // Pathological inputs must still be sanitized & clamped to [-4.0, 4.0] in bypass
+            for &(bad_l, bad_r) in &[
+                (f32::NAN, f32::INFINITY),
+                (f32::NEG_INFINITY, 1.0e20),
+                (-9.5, 12.0),
+            ] {
+                let out = dsp.process_sample(bad_l, bad_r, &cfg);
+                assert!(out.out_l.is_finite() && out.out_l.abs() <= SAFETY_CLAMP_LIMIT);
+                assert!(out.out_r.is_finite() && out.out_r.abs() <= SAFETY_CLAMP_LIMIT);
+            }
+            let nan_out = dsp.process_sample(f32::NAN, f32::NEG_INFINITY, &cfg);
+            assert_eq!(nan_out.out_l, 0.0);
+            assert_eq!(nan_out.out_r, 0.0);
+
+            // Initialized already bypassed: bit-identical from the very first sample
+            let mut pre_bypassed = StereoPunchDsp::new(sr);
+            pre_bypassed.sync_bypass_state(true);
+            let first = pre_bypassed.process_sample(0.3125, -0.625, &cfg);
+            assert_eq!(first.out_l.to_bits(), 0.3125_f32.to_bits());
+            assert_eq!(first.out_r.to_bits(), (-0.625_f32).to_bits());
+        }
+    }
+
+    #[test]
+    fn test_bypass_smooth_transition_no_clicks() {
+        let sr = 48000.0_f32;
+        let freq_hz = 250.0_f32;
+        let mut dsp = StereoPunchDsp::new(sr);
+        let mut cfg = DspConfig {
+            input_db: 6.0,
+            threshold_db: -20.0,
+            ratio: 8.0,
+            attack_ms: 1.0,
+            release_ms: 80.0,
+            auto_makeup: false,
+            makeup_db: 0.0,
+            eq_low_cut_hz: 120.0,
+            clipper_mode: ClipperMode::HardClip,
+            ceiling_db: -6.0,
+            mix_pct: 100.0,
+            bypass: false,
+            ..DspConfig::default()
+        };
+
+        let mut prev_l = 0.0_f32;
+        let mut prev_r = 0.0_f32;
+        for n in 0..4800 {
+            let s = 0.5 * (2.0 * std::f32::consts::PI * freq_hz * (n as f32) / sr).sin();
+            let out = dsp.process_sample(s, -s, &cfg);
+            prev_l = out.out_l;
+            prev_r = out.out_r;
+        }
+
+        // Toggle ON -> OFF -> ON and verify smooth sample-to-sample steps (< 0.05) and < 20 ms settle
+        let ramp_window = (0.020 * sr) as usize; // 20 ms
+        let mut max_step_to_bypass = 0.0_f32;
+        cfg.bypass = true;
+        for n in 0..ramp_window {
+            let s = 0.5 * (2.0 * std::f32::consts::PI * freq_hz * ((4800 + n) as f32) / sr).sin();
+            let out = dsp.process_sample(s, -s, &cfg);
+            max_step_to_bypass = max_step_to_bypass
+                .max((out.out_l - prev_l).abs())
+                .max((out.out_r - prev_r).abs());
+            prev_l = out.out_l;
+            prev_r = out.out_r;
+        }
+        assert!(
+            max_step_to_bypass < 0.05,
+            "Bypass activation produced click-like step: {}",
+            max_step_to_bypass
+        );
+
+        let check_s =
+            0.5 * (2.0 * std::f32::consts::PI * freq_hz * ((4800 + ramp_window) as f32) / sr).sin();
+        let settled = dsp.process_sample(check_s, -check_s, &cfg);
+        assert!(
+            (settled.out_l - check_s).abs() < 1.0e-6,
+            "Bypass did not reach full transparency within 20 ms: diff={}",
+            (settled.out_l - check_s).abs()
+        );
+        prev_l = settled.out_l;
+        prev_r = settled.out_r;
+
+        let mut max_step_to_active = 0.0_f32;
+        cfg.bypass = false;
+        for n in 0..ramp_window {
+            let idx = 4800 + ramp_window + 1 + n;
+            let s = 0.5 * (2.0 * std::f32::consts::PI * freq_hz * (idx as f32) / sr).sin();
+            let out = dsp.process_sample(s, -s, &cfg);
+            max_step_to_active = max_step_to_active
+                .max((out.out_l - prev_l).abs())
+                .max((out.out_r - prev_r).abs());
+            prev_l = out.out_l;
+            prev_r = out.out_r;
+        }
+        assert!(
+            max_step_to_active < 0.05,
+            "Bypass deactivation produced click-like step: {}",
+            max_step_to_active
+        );
+
+        // Rapid toggles every 100 samples (~2 ms) remain bounded and smooth
+        let mut max_rapid_step = 0.0_f32;
+        for n in 0..2000 {
+            if n % 100 == 0 {
+                cfg.bypass = !cfg.bypass;
+            }
+            let idx = 4800 + 2 * ramp_window + 1 + n;
+            let s = 0.5 * (2.0 * std::f32::consts::PI * freq_hz * (idx as f32) / sr).sin();
+            let out = dsp.process_sample(s, -s, &cfg);
+            assert!(out.out_l.is_finite() && out.out_l.abs() <= SAFETY_CLAMP_LIMIT);
+            assert!(out.out_r.is_finite() && out.out_r.abs() <= SAFETY_CLAMP_LIMIT);
+            max_rapid_step = max_rapid_step
+                .max((out.out_l - prev_l).abs())
+                .max((out.out_r - prev_r).abs());
+            prev_l = out.out_l;
+            prev_r = out.out_r;
+        }
+        assert!(
+            max_rapid_step < 0.05,
+            "Rapid bypass toggles produced discontinuous step: {}",
+            max_rapid_step
+        );
+    }
+
+    #[test]
+    fn test_bypass_parameter_daw_integration_and_compat() {
+        use nih_plug::prelude::{ParamFlags, Params, Vst3Plugin};
+        use nih_plug::wrapper::clap::{
+            clap_host, clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID, CLAP_VERSION,
+        };
+        use nih_plug::wrapper::vst3::vst3_sys::base::{kResultOk, IPluginBase, IPluginFactory};
+        use nih_plug::wrapper::vst3::vst3_sys::vst::{
+            IAudioProcessor, IComponent, IEditController, ParameterFlags, ParameterInfo,
+            ProcessModes, ProcessSetup, SymbolicSampleSizes,
+        };
+        use nih_plug::wrapper::vst3::vst3_sys::{ComInterface, VstPtr, IID};
+        use std::ffi::{c_void, CStr};
+
+        const TEST_CLAP_PARAM_IS_BYPASS: u32 = 1 << 4;
+        const TEST_CLAP_PARAM_IS_AUTOMATABLE: u32 = 1 << 5;
+
+        #[repr(C)]
+        struct TestClapOStream {
+            ctx: *mut c_void,
+            write: Option<unsafe extern "C" fn(*const TestClapOStream, *const c_void, u64) -> i64>,
+        }
+        #[repr(C)]
+        struct TestClapIStream {
+            ctx: *mut c_void,
+            read: Option<unsafe extern "C" fn(*const TestClapIStream, *mut c_void, u64) -> i64>,
+        }
+        #[repr(C)]
+        struct TestClapPluginState {
+            save: Option<
+                unsafe extern "C" fn(
+                    plugin: *const nih_plug::wrapper::clap::clap_plugin,
+                    stream: *const TestClapOStream,
+                ) -> bool,
+            >,
+            load: Option<
+                unsafe extern "C" fn(
+                    plugin: *const nih_plug::wrapper::clap::clap_plugin,
+                    stream: *const TestClapIStream,
+                ) -> bool,
+            >,
+        }
+        struct VecReadCtx<'a> {
+            data: &'a [u8],
+            pos: usize,
+        }
+        unsafe extern "C" fn test_clap_ostream_write(
+            stream: *const TestClapOStream,
+            buffer: *const c_void,
+            size: u64,
+        ) -> i64 {
+            let buf = &mut *((*stream).ctx as *mut Vec<u8>);
+            let slice = std::slice::from_raw_parts(buffer as *const u8, size as usize);
+            buf.extend_from_slice(slice);
+            size as i64
+        }
+        unsafe extern "C" fn test_clap_istream_read(
+            stream: *const TestClapIStream,
+            buffer: *mut c_void,
+            size: u64,
+        ) -> i64 {
+            let ctx = &mut *((*stream).ctx as *mut VecReadCtx);
+            let remaining = ctx.data.len().saturating_sub(ctx.pos);
+            let to_read = remaining.min(size as usize);
+            if to_read > 0 {
+                std::ptr::copy_nonoverlapping(
+                    ctx.data.as_ptr().add(ctx.pos),
+                    buffer as *mut u8,
+                    to_read,
+                );
+                ctx.pos += to_read;
+            }
+            to_read as i64
+        }
+
+        // 1. Default false, unique ParamFlags::BYPASS on "bypass"
+        let params = OmorePunchParams::default();
+        assert!(!params.bypass.value(), "Bypass must default to OFF (false)");
+
+        let param_map = params.param_map();
+        let bypass_entries: Vec<_> = param_map
+            .iter()
+            .filter(|(_, ptr, _)| unsafe { ptr.flags() }.contains(ParamFlags::BYPASS))
+            .collect();
+        assert_eq!(
+            bypass_entries.len(),
+            1,
+            "Exactly one parameter must carry ParamFlags::BYPASS"
+        );
+        assert_eq!(bypass_entries[0].0, "bypass");
+
+        // 2. CLAP exposition + state persistence + legacy backward compatibility (no "bypass" key)
+        let host_name = b"BypassClapCheck\0";
+        let host = clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: std::ptr::null_mut(),
+            name: host_name.as_ptr() as *const std::ffi::c_char,
+            vendor: std::ptr::null(),
+            url: std::ptr::null(),
+            version: std::ptr::null(),
+            get_extension: Some(test_clap_host_get_extension),
+            request_restart: Some(test_clap_host_noop),
+            request_process: Some(test_clap_host_noop),
+            request_callback: Some(test_clap_host_noop),
+        };
+        unsafe {
+            assert!((super::clap::clap_entry.init.unwrap())(std::ptr::null()));
+            let factory = (super::clap::clap_entry.get_factory.unwrap())(
+                CLAP_PLUGIN_FACTORY_ID.as_ptr(),
+            ) as *const clap_plugin_factory;
+            let desc = ((*factory).get_plugin_descriptor.unwrap())(factory, 0);
+            let plugin = ((*factory).create_plugin.unwrap())(factory, &host, (*desc).id);
+            assert!(((*plugin).init.unwrap())(plugin));
+
+            let params_ext_id = b"clap.params\0";
+            let clap_params = ((*plugin).get_extension.unwrap())(
+                plugin,
+                params_ext_id.as_ptr() as *const std::ffi::c_char,
+            ) as *const TestClapPluginParams;
+            assert!(!clap_params.is_null());
+
+            let count = ((*clap_params).count.unwrap())(plugin);
+            let get_info = (*clap_params).get_info.unwrap();
+            let mut clap_bypass_count = 0_usize;
+            let mut clap_bypass_id = 0_u32;
+            for idx in 0..count {
+                let mut info: TestClapParamInfo = std::mem::zeroed();
+                assert!(get_info(plugin, idx, &mut info));
+                if (info.flags & TEST_CLAP_PARAM_IS_BYPASS) != 0 {
+                    clap_bypass_count += 1;
+                    clap_bypass_id = info.id;
+                    let name = CStr::from_ptr(info.name.as_ptr())
+                        .to_string_lossy()
+                        .into_owned();
+                    assert_eq!(name, "Bypass");
+                    assert_ne!(
+                        info.flags & TEST_CLAP_PARAM_IS_AUTOMATABLE,
+                        0,
+                        "CLAP bypass parameter must remain automatable"
+                    );
+                    assert_eq!(info.default_value, 0.0);
+                }
+            }
+            assert_eq!(clap_bypass_count, 1);
+
+            // Save default state -> remove "bypass" entry -> load legacy state -> verify OFF
+            let state_ext_id = b"clap.state\0";
+            let clap_state = ((*plugin).get_extension.unwrap())(
+                plugin,
+                state_ext_id.as_ptr() as *const std::ffi::c_char,
+            ) as *const TestClapPluginState;
+            assert!(!clap_state.is_null());
+
+            let mut saved_bytes = Vec::<u8>::new();
+            let ostream = TestClapOStream {
+                ctx: (&mut saved_bytes as *mut Vec<u8>).cast(),
+                write: Some(test_clap_ostream_write),
+            };
+            assert!(((*clap_state).save.unwrap())(plugin, &ostream));
+            assert!(saved_bytes.len() > 8);
+            let state_len = u64::from_le_bytes(saved_bytes[..8].try_into().unwrap()) as usize;
+            assert_eq!(state_len + 8, saved_bytes.len());
+            let state_str = std::str::from_utf8(&saved_bytes[8..]).unwrap().to_string();
+            assert!(
+                state_str.contains("\"bypass\":{\"bool\":false}"),
+                "Saved DAW state must serialize bypass=false parameter: {}",
+                state_str
+            );
+
+            let encode_clap_state = |json: &str| -> Vec<u8> {
+                let mut out = Vec::with_capacity(8 + json.len());
+                out.extend_from_slice(&(json.len() as u64).to_le_bytes());
+                out.extend_from_slice(json.as_bytes());
+                out
+            };
+
+            // Strip `"bypass":{"bool":false}` to simulate pre-bypass session
+            let legacy_str = state_str
+                .replace("\"bypass\":{\"bool\":false},", "")
+                .replace(",\"bypass\":{\"bool\":false}", "");
+            assert!(!legacy_str.contains("\"bypass\""));
+            let legacy_bytes = encode_clap_state(&legacy_str);
+            let mut legacy_ctx = VecReadCtx {
+                data: &legacy_bytes,
+                pos: 0,
+            };
+            let legacy_istream = TestClapIStream {
+                ctx: (&mut legacy_ctx as *mut VecReadCtx).cast(),
+                read: Some(test_clap_istream_read),
+            };
+            assert!(((*clap_state).load.unwrap())(plugin, &legacy_istream));
+            let mut val = -1.0_f64;
+            assert!(((*clap_params).get_value.unwrap())(
+                plugin,
+                clap_bypass_id,
+                &mut val
+            ));
+            assert_eq!(val, 0.0, "Legacy state without bypass key must default to OFF");
+
+            // Load a session with `"bypass":{"bool":true}` and confirm restored value == 1.0
+            let on_str = state_str.replace(
+                "\"bypass\":{\"bool\":false}",
+                "\"bypass\":{\"bool\":true}",
+            );
+            let on_bytes = encode_clap_state(&on_str);
+            let mut on_ctx = VecReadCtx {
+                data: &on_bytes,
+                pos: 0,
+            };
+            let on_istream = TestClapIStream {
+                ctx: (&mut on_ctx as *mut VecReadCtx).cast(),
+                read: Some(test_clap_istream_read),
+            };
+            assert!(((*clap_state).load.unwrap())(plugin, &on_istream));
+            let mut val_on = -1.0_f64;
+            assert!(((*clap_params).get_value.unwrap())(
+                plugin,
+                clap_bypass_id,
+                &mut val_on
+            ));
+            assert_eq!(val_on, 1.0, "Restored bypass=true state must read 1.0");
+
+            ((*plugin).destroy.unwrap())(plugin);
+        }
+
+        // 3. VST3 exposition: ParameterFlags::kIsBypass | kCanAutomate + pre-bypassed init
+        unsafe {
+            let factory =
+                VstPtr::<dyn IPluginFactory>::owned(super::vst3::GetPluginFactory() as *mut *mut _)
+                    .unwrap();
+            let cid = IID {
+                data: OmorePunch::PLATFORM_VST3_CLASS_ID,
+            };
+            let mut raw = std::ptr::null_mut();
+            assert_eq!(
+                factory.create_instance(&cid, &<dyn IComponent>::IID, &mut raw),
+                kResultOk
+            );
+            let comp = VstPtr::<dyn IComponent>::owned(raw as *mut *mut _).unwrap();
+            let edit = comp.cast::<dyn IEditController>().unwrap();
+            let proc_if = comp.cast::<dyn IAudioProcessor>().unwrap();
+
+            let count = edit.get_parameter_count();
+            let mut vst3_bypass_id = None;
+            let mut threshold_id = None;
+            for idx in 0..count {
+                let mut info: ParameterInfo = std::mem::zeroed();
+                assert_eq!(edit.get_parameter_info(idx, &mut info), kResultOk);
+                let end = info.title.iter().position(|&c| c == 0).unwrap_or(128);
+                let utf16: Vec<u16> = info.title[..end].iter().map(|&c| c as u16).collect();
+                let title = String::from_utf16_lossy(&utf16);
+                if (info.flags & (ParameterFlags::kIsBypass as i32)) != 0 {
+                    assert!(vst3_bypass_id.is_none(), "Duplicate VST3 kIsBypass param");
+                    assert_eq!(title, "Bypass");
+                    assert_ne!(info.flags & (ParameterFlags::kCanAutomate as i32), 0);
+                    assert_eq!(info.default_normalized_value, 0.0);
+                    vst3_bypass_id = Some(info.id);
+                }
+                if title == "Threshold" {
+                    threshold_id = Some(info.id);
+                }
+            }
+            let bypass_id = vst3_bypass_id.expect("VST3 kIsBypass parameter missing");
+            let thresh_id = threshold_id.expect("Threshold parameter missing");
+
+            // Initialize session already bypassed (loaded with bypass = true) and verify
+            // bit-exact passthrough from the very first sample even with heavy threshold
+            assert_eq!(edit.set_param_normalized(thresh_id, 0.0), kResultOk);
+            assert_eq!(edit.set_param_normalized(bypass_id, 1.0), kResultOk);
+
+            let mut arr_in: u64 = 3;
+            let mut arr_out: u64 = 3;
+            assert_eq!(
+                proc_if.set_bus_arrangements(&mut arr_in, 1, &mut arr_out, 1),
+                kResultOk
+            );
+            let setup = ProcessSetup {
+                process_mode: ProcessModes::kRealtime as i32,
+                symbolic_sample_size: SymbolicSampleSizes::kSample32 as i32,
+                max_samples_per_block: 128,
+                sample_rate: 48000.0,
+            };
+            assert_eq!(proc_if.setup_processing(&setup), kResultOk);
+            assert_eq!(comp.set_active(1), kResultOk);
+            assert_eq!(proc_if.set_processing(1), kResultOk);
+
+            let in_l: Vec<f32> = (0..128).map(|i| 0.7 * ((i as f32) * 0.1).sin()).collect();
+            let in_r: Vec<f32> = (0..128).map(|i| -0.5 * ((i as f32) * 0.13).cos()).collect();
+            let (out_l, out_r) = process_vst3_stereo_block_out(&proc_if, &in_l, &in_r);
+            for i in 0..128 {
+                assert_eq!(
+                    out_l[i].to_bits(),
+                    in_l[i].to_bits(),
+                    "Pre-bypassed session altered first block Left sample {}",
+                    i
+                );
+                assert_eq!(
+                    out_r[i].to_bits(),
+                    in_r[i].to_bits(),
+                    "Pre-bypassed session altered first block Right sample {}",
+                    i
+                );
+            }
+            assert_eq!(comp.terminate(), kResultOk);
+        }
+    }
+
+    #[test]
+    fn test_bypass_freezes_gain_match_and_clears_gr_and_clip() {
+        use super::vst3::IGainReductionInfo;
+        use nih_plug::prelude::Vst3Plugin;
+        use nih_plug::wrapper::vst3::vst3_sys::base::{kResultOk, IPluginBase, IPluginFactory};
+        use nih_plug::wrapper::vst3::vst3_sys::vst::{
+            IAudioProcessor, IComponent, IEditController, ParameterInfo, ProcessModes,
+            ProcessSetup, SymbolicSampleSizes,
+        };
+        use nih_plug::wrapper::vst3::vst3_sys::{ComInterface, VstPtr, IID};
+
+        // 1. DSP-level check: Gain Match trim is strictly frozen across bypass, GR=0, clipped=false
+        let sr = 48000.0_f32;
+        let mut dsp = StereoPunchDsp::new(sr);
+        let mut cfg = DspConfig {
+            input_db: 0.0,
+            threshold_db: -20.0,
+            ratio: 8.0,
+            attack_ms: 1.0,
+            release_ms: 80.0,
+            auto_makeup: false,
+            makeup_db: 6.0,
+            clipper_mode: ClipperMode::SoftClip,
+            ceiling_db: -3.0,
+            mix_pct: 100.0,
+            gain_match: true,
+            bypass: false,
+            ..DspConfig::default()
+        };
+
+        for n in 0..96000 {
+            let phase = 2.0 * std::f32::consts::PI * 1000.0 * (n as f32) / sr;
+            let s = 0.6 * phase.sin();
+            dsp.process_sample(s, s, &cfg);
+        }
+        let frozen_trim = dsp.gm_gain_db;
+        assert!(
+            frozen_trim.abs() > 1.0,
+            "Expected meaningful Gain Match trim before bypass, got {}",
+            frozen_trim
+        );
+
+        // Engage bypass and run both hot clipped signals and silence for 1 second
+        cfg.bypass = true;
+        for n in 0..48000 {
+            let phase = 2.0 * std::f32::consts::PI * 1000.0 * (n as f32) / sr;
+            let s = if n < 24000 { 2.5 * phase.sin() } else { 0.0 };
+            let out = dsp.process_sample(s, s, &cfg);
+            assert_eq!(
+                out.gr_db, 0.0,
+                "Instantaneous GR must read 0.0 dB while bypassed (sample {})",
+                n
+            );
+            assert!(
+                !out.clipped,
+                "Clipper must not signal internal clipping while bypassed (sample {})",
+                n
+            );
+            assert_eq!(
+                out.gain_match_db.to_bits(),
+                frozen_trim.to_bits(),
+                "Gain Match trim changed during bypass at sample {}",
+                n
+            );
+        }
+
+        // Disengage bypass: Gain Match resumes from frozen_trim without level jump or reset
+        cfg.bypass = false;
+        let first_return = dsp.process_sample(0.6, 0.6, &cfg);
+        assert!(
+            (first_return.gain_match_db - frozen_trim).abs() < 0.05,
+            "Gain Match jumped on bypass exit: before={} after={}",
+            frozen_trim,
+            first_return.gain_match_db
+        );
+
+        // 2. Full OmorePunch::process + MeterTelemetry + IGainReductionInfo check via VST3
+        unsafe {
+            let _ = take_last_inspectable_telemetry();
+            let factory =
+                VstPtr::<dyn IPluginFactory>::owned(super::vst3::GetPluginFactory() as *mut *mut _)
+                    .unwrap();
+            let cid = IID {
+                data: OmorePunch::PLATFORM_VST3_CLASS_ID,
+            };
+            let mut raw = std::ptr::null_mut();
+            assert_eq!(
+                factory.create_instance(&cid, &<dyn IComponent>::IID, &mut raw),
+                kResultOk
+            );
+            let telemetry = take_last_inspectable_telemetry()
+                .expect("Expected MeterTelemetry captured from new VST3 instance");
+            let comp = VstPtr::<dyn IComponent>::owned(raw as *mut *mut _).unwrap();
+            let edit = comp.cast::<dyn IEditController>().unwrap();
+            let proc_if = comp.cast::<dyn IAudioProcessor>().unwrap();
+            let gr_if = comp.cast::<dyn IGainReductionInfo>().unwrap();
+
+            let mut bypass_id = None;
+            let mut threshold_id = None;
+            for idx in 0..edit.get_parameter_count() {
+                let mut info: ParameterInfo = std::mem::zeroed();
+                assert_eq!(edit.get_parameter_info(idx, &mut info), kResultOk);
+                let end = info.title.iter().position(|&c| c == 0).unwrap_or(128);
+                let utf16: Vec<u16> = info.title[..end].iter().map(|&c| c as u16).collect();
+                let title = String::from_utf16_lossy(&utf16);
+                if title == "Bypass" {
+                    bypass_id = Some(info.id);
+                } else if title == "Threshold" {
+                    threshold_id = Some(info.id);
+                }
+            }
+            let bypass_id = bypass_id.unwrap();
+            let threshold_id = threshold_id.unwrap();
+
+            assert_eq!(edit.set_param_normalized(threshold_id, 0.25), kResultOk);
+            let mut arr_in: u64 = 3;
+            let mut arr_out: u64 = 3;
+            assert_eq!(
+                proc_if.set_bus_arrangements(&mut arr_in, 1, &mut arr_out, 1),
+                kResultOk
+            );
+            let setup = ProcessSetup {
+                process_mode: ProcessModes::kRealtime as i32,
+                symbolic_sample_size: SymbolicSampleSizes::kSample32 as i32,
+                max_samples_per_block: 512,
+                sample_rate: 48000.0,
+            };
+            assert_eq!(proc_if.setup_processing(&setup), kResultOk);
+            assert_eq!(comp.set_active(1), kResultOk);
+            assert_eq!(proc_if.set_processing(1), kResultOk);
+
+            let hot: Vec<f32> = (0..512)
+                .map(|i| 2.5 * (2.0 * std::f32::consts::PI * 1000.0 * (i as f32) / 48000.0).sin())
+                .collect();
+            for _ in 0..6 {
+                process_vst3_stereo_block(&proc_if, &hot, &hot);
+            }
+
+            let held_max_before = load_f32_relaxed(&telemetry.max_gr_db);
+            assert!(held_max_before > 1.0, "Expected recorded Max GR before bypass");
+            assert!(
+                telemetry.clip_latched.load(Ordering::Relaxed),
+                "Expected pre-existing clip latch before bypass"
+            );
+            assert!(gr_if.get_gain_reduction_value_in_db() < -0.5);
+
+            // Engage bypass via VST3 host: current GR drops to 0.0 dB, Max GR & Clip stay frozen
+            assert_eq!(proc_if.set_processing(0), kResultOk);
+            assert_eq!(edit.set_param_normalized(bypass_id, 1.0), kResultOk);
+            assert_eq!(proc_if.set_processing(1), kResultOk);
+
+            for _ in 0..4 {
+                process_vst3_stereo_block(&proc_if, &hot, &hot);
+            }
+            assert_eq!(
+                load_f32_relaxed(&telemetry.current_gr_db).to_bits(),
+                0.0_f32.to_bits(),
+                "UI current_gr_db must drop to 0.0 while bypassed"
+            );
+            assert_eq!(
+                gr_if.get_gain_reduction_value_in_db().to_bits(),
+                0.0_f64.to_bits(),
+                "Host GR meter must drop to 0.0 dB while bypassed"
+            );
+            assert_eq!(
+                load_f32_relaxed(&telemetry.max_gr_db).to_bits(),
+                held_max_before.to_bits(),
+                "Max GR hold must remain frozen while bypassed"
+            );
+            assert!(
+                telemetry.clip_latched.load(Ordering::Relaxed),
+                "Pre-existing clip latch must stay visible until manually acknowledged"
+            );
+
+            // Reset clip latch while bypassed, feed > 0 dBFS signal (< safety clamp): must NOT re-latch
+            telemetry.clip_latched.store(false, Ordering::Relaxed);
+            let over_ceiling: Vec<f32> = (0..512)
+                .map(|i| 2.0 * (2.0 * std::f32::consts::PI * 1000.0 * (i as f32) / 48000.0).sin())
+                .collect();
+            for _ in 0..4 {
+                process_vst3_stereo_block(&proc_if, &over_ceiling, &over_ceiling);
+            }
+            assert!(
+                !telemetry.clip_latched.load(Ordering::Relaxed),
+                "Bypassed clipper must not trigger clip indicator"
+            );
+
+            assert_eq!(comp.terminate(), kResultOk);
         }
     }
 
