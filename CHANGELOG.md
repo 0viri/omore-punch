@@ -31,6 +31,10 @@ Toutes les modifications notables de ce projet sont documentées dans ce fichier
   - Passage de `OmorePunch::VENDOR` et `Cargo.toml` (`authors`) à `Omore` (aligné avec *Omore Sampler*), tout en conservant strictement inchangés `VST3_CLASS_ID`, `CLAP_ID` et tous les identifiants de paramètres pour une rétrocompatibilité totale des projets DAW existants.
   - Renommage des bundles générés en `Omore Punch.vst3` et `Omore Punch.clap` via `bundler.toml`, mise à jour des artefacts CI (`.github/workflows/build.yml`) et nettoyage automatique des anciens bundles `omore-punch.*` dans `build.sh` et `build.ps1`.
 
+### Corrigé
+- **Flush anti-dénormaux dans `sanitize_sample()` et le filtre HPF de sidechain (`sanitize-sample-denormal-flush`) :**
+  - Application uniforme du seuil anti-dénormaux (`1.0e-20`) dans `sanitize_sample()` et sur les mémoires d'entrée `sc_prev_in_l/r` du filtre passe-haut de sidechain via `flush_denormal()`, éliminant tout flottant subnormal en entrée, en sortie (y compris en bypass) et dans les états internes du détecteur tout en préservant la transparence bit-exacte des signaux normaux.
+
 ### Supprimé
 - **Retrait du paramètre DAW `gr_meter_db` (`007-gain-reduction-metering`) :**
   - Suppression complète du paramètre exposé `gr_meter_db` (`Gain Reduction (dB)`) de `OmorePunchParams` et de sa synchronisation depuis l'interface `egui`, évitant toute entrée superflue dans les listes de paramètres et pistes d'automation DAW maintenant que les extensions de metering GR natives VST3/CLAP sont en place.

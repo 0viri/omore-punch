@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 const SAFETY_CLAMP_LIMIT: f32 = 4.0;
+const DENORMAL_FLUSH_THRESHOLD: f32 = 1.0e-20;
 const MIN_DETECTOR_PEAK: f32 = 1.0e-6;
 const MIN_FLOOR_DB: f32 = -60.0;
 const MAX_GR_METER_DB: f32 = 24.0;
@@ -42,12 +43,17 @@ fn load_f32_relaxed(atom: &AtomicU32) -> f32 {
 }
 
 #[inline(always)]
-pub fn sanitize_sample(x: f32) -> f32 {
-    if x.is_finite() {
-        x.clamp(-SAFETY_CLAMP_LIMIT, SAFETY_CLAMP_LIMIT)
+fn flush_denormal(x: f32) -> f32 {
+    if x.is_finite() && x.abs() > DENORMAL_FLUSH_THRESHOLD {
+        x
     } else {
         0.0
     }
+}
+
+#[inline(always)]
+pub fn sanitize_sample(x: f32) -> f32 {
+    flush_denormal(x).clamp(-SAFETY_CLAMP_LIMIT, SAFETY_CLAMP_LIMIT)
 }
 
 #[inline(always)]
@@ -738,19 +744,11 @@ impl StereoPunchDsp {
             let raw_det_l = self.sc_hpf_coeff * (self.sc_prev_out_l + driven_l - self.sc_prev_in_l);
             let raw_det_r = self.sc_hpf_coeff * (self.sc_prev_out_r + driven_r - self.sc_prev_in_r);
 
-            let clean_det_l = if raw_det_l.is_finite() && raw_det_l.abs() > 1.0e-20 {
-                raw_det_l
-            } else {
-                0.0
-            };
-            let clean_det_r = if raw_det_r.is_finite() && raw_det_r.abs() > 1.0e-20 {
-                raw_det_r
-            } else {
-                0.0
-            };
+            let clean_det_l = flush_denormal(raw_det_l);
+            let clean_det_r = flush_denormal(raw_det_r);
 
-            self.sc_prev_in_l = if driven_l.is_finite() { driven_l } else { 0.0 };
-            self.sc_prev_in_r = if driven_r.is_finite() { driven_r } else { 0.0 };
+            self.sc_prev_in_l = flush_denormal(driven_l);
+            self.sc_prev_in_r = flush_denormal(driven_r);
             self.sc_prev_out_l = clean_det_l;
             self.sc_prev_out_r = clean_det_r;
 
@@ -4000,6 +3998,31 @@ mod tests {
             ReleaseMode::Manual
         );
 
+        // Subnormals, threshold-floor values, and -0.0 must flush to exact +0.0
+        for &sub_or_zero in &[
+            1.0e-39_f32,
+            -1.0e-39_f32,
+            DENORMAL_FLUSH_THRESHOLD,
+            -DENORMAL_FLUSH_THRESHOLD,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            -0.0_f32,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            assert_eq!(
+                sanitize_sample(sub_or_zero).to_bits(),
+                0.0_f32.to_bits(),
+                "sanitize_sample({:?}) must flush to exact +0.0",
+                sub_or_zero
+            );
+        }
+        assert_eq!(sanitize_sample(0.25_f32).to_bits(), 0.25_f32.to_bits());
+        assert_eq!(sanitize_sample(-0.25_f32).to_bits(), (-0.25_f32).to_bits());
+        assert_eq!(sanitize_sample(10.0_f32), SAFETY_CLAMP_LIMIT);
+        assert_eq!(sanitize_sample(-10.0_f32), -SAFETY_CLAMP_LIMIT);
+
         let sr = 48000.0_f32;
         let pathological_inputs = [
             (f32::NAN, f32::NAN),
@@ -4063,6 +4086,28 @@ mod tests {
                         mode,
                         out.out_r
                     );
+                    assert!(
+                        (out.out_l == 0.0 || out.out_l.is_normal())
+                            && (out.out_r == 0.0 || out.out_r.is_normal()),
+                        "[{:?}] Subnormal output leaked: L={} R={}",
+                        mode,
+                        out.out_l,
+                        out.out_r
+                    );
+                    for (sc_name, sc_val) in [
+                        ("sc_prev_in_l", dsp.sc_prev_in_l),
+                        ("sc_prev_in_r", dsp.sc_prev_in_r),
+                        ("sc_prev_out_l", dsp.sc_prev_out_l),
+                        ("sc_prev_out_r", dsp.sc_prev_out_r),
+                    ] {
+                        assert!(
+                            sc_val.is_finite() && (sc_val == 0.0 || sc_val.is_normal()),
+                            "[{:?}] Sidechain HPF state {} invalid/subnormal: {}",
+                            mode,
+                            sc_name,
+                            sc_val
+                        );
+                    }
                     assert!(
                         dsp.env_gr_db.is_finite()
                             && (dsp.env_gr_db == 0.0 || dsp.env_gr_db.is_normal()),
@@ -4148,6 +4193,25 @@ mod tests {
                     mode
                 );
             }
+        }
+
+        // Fresh DSP receiving pure subnormals must flush both sc_prev_in_* and output (active & bypass)
+        for bypass in [false, true] {
+            let mut sub_dsp = StereoPunchDsp::new(sr);
+            sub_dsp.sync_bypass_state(bypass);
+            let sub_cfg = DspConfig {
+                input_db: 12.0,
+                sc_hpf_hz: 90.0,
+                bypass,
+                ..DspConfig::default()
+            };
+            let out = sub_dsp.process_sample(1.0e-39, -1.0e-39, &sub_cfg);
+            assert_eq!(out.out_l.to_bits(), 0.0_f32.to_bits());
+            assert_eq!(out.out_r.to_bits(), 0.0_f32.to_bits());
+            assert_eq!(sub_dsp.sc_prev_in_l.to_bits(), 0.0_f32.to_bits());
+            assert_eq!(sub_dsp.sc_prev_in_r.to_bits(), 0.0_f32.to_bits());
+            assert_eq!(sub_dsp.sc_prev_out_l.to_bits(), 0.0_f32.to_bits());
+            assert_eq!(sub_dsp.sc_prev_out_r.to_bits(), 0.0_f32.to_bits());
         }
     }
 
