@@ -1138,6 +1138,154 @@ impl Default for OmorePunchParams {
 }
 
 // ----------------------------------------------------------------------------
+// Preset & State Sanitization (Backward Compatibility + Range Clamping)
+// ----------------------------------------------------------------------------
+
+struct FloatParamSpec {
+    id: &'static str,
+    default: f32,
+    min: f32,
+    max: f32,
+}
+
+const FLOAT_PARAM_SPECS: &[FloatParamSpec] = &[
+    FloatParamSpec {
+        id: "input_db",
+        default: 0.0,
+        min: -12.0,
+        max: 12.0,
+    },
+    FloatParamSpec {
+        id: "threshold_db",
+        default: 0.0,
+        min: -40.0,
+        max: 0.0,
+    },
+    FloatParamSpec {
+        id: "ratio",
+        default: 4.0,
+        min: 1.0,
+        max: 20.0,
+    },
+    FloatParamSpec {
+        id: "attack_ms",
+        default: 3.0,
+        min: 0.1,
+        max: 100.0,
+    },
+    FloatParamSpec {
+        id: "release_ms",
+        default: 80.0,
+        min: 10.0,
+        max: 500.0,
+    },
+    FloatParamSpec {
+        id: "sc_hpf_hz",
+        default: 20.0,
+        min: 20.0,
+        max: 250.0,
+    },
+    FloatParamSpec {
+        id: "makeup_db",
+        default: 0.0,
+        min: -12.0,
+        max: 24.0,
+    },
+    FloatParamSpec {
+        id: "eq_low_cut_hz",
+        default: 20.0,
+        min: 20.0,
+        max: 160.0,
+    },
+    FloatParamSpec {
+        id: "eq_mid_cut_db",
+        default: 0.0,
+        min: -12.0,
+        max: 0.0,
+    },
+    FloatParamSpec {
+        id: "eq_high_shelf_db",
+        default: 0.0,
+        min: -6.0,
+        max: 12.0,
+    },
+    FloatParamSpec {
+        id: "ceiling_db",
+        default: 0.0,
+        min: -6.0,
+        max: 0.0,
+    },
+    FloatParamSpec {
+        id: "mix_pct",
+        default: 100.0,
+        min: 0.0,
+        max: 100.0,
+    },
+];
+
+const BOOL_PARAM_SPECS: &[(&str, bool)] = &[("auto_makeup", true), ("gain_match", false)];
+
+struct EnumParamSpec {
+    id: &'static str,
+    default_id: &'static str,
+    variant_ids: &'static [&'static str],
+}
+
+const ENUM_PARAM_SPECS: &[EnumParamSpec] = &[
+    EnumParamSpec {
+        id: "release_mode",
+        default_id: "manual",
+        variant_ids: &["manual", "auto_tight", "auto_punch", "auto_glue"],
+    },
+    EnumParamSpec {
+        id: "clipper_mode",
+        default_id: "soft_clip",
+        variant_ids: &["soft_clip", "hard_clip", "bypass_clip"],
+    },
+];
+
+/// Normalizes a deserialized `PluginState` before `nih_plug` applies it so partial,
+/// legacy, or malformed Reaper presets fill missing defaults, clamp floats, validate
+/// enums, and drop unknown keys without retaining stale parameters.
+pub fn sanitize_plugin_state(state: &mut PluginState) {
+    use nih_plug::wrapper::state::ParamValue;
+    use std::collections::BTreeMap;
+
+    let mut clean_params = BTreeMap::new();
+
+    for spec in FLOAT_PARAM_SPECS {
+        let value = match state.params.get(spec.id) {
+            Some(ParamValue::F32(v)) if v.is_finite() => v.clamp(spec.min, spec.max),
+            Some(ParamValue::I32(v)) => (*v as f32).clamp(spec.min, spec.max),
+            _ => spec.default,
+        };
+        clean_params.insert(spec.id.to_string(), ParamValue::F32(value));
+    }
+
+    for &(id, default_val) in BOOL_PARAM_SPECS {
+        let value = match state.params.get(id) {
+            Some(ParamValue::Bool(b)) => *b,
+            _ => default_val,
+        };
+        clean_params.insert(id.to_string(), ParamValue::Bool(value));
+    }
+
+    for spec in ENUM_PARAM_SPECS {
+        let variant_id = match state.params.get(spec.id) {
+            Some(ParamValue::String(s)) if spec.variant_ids.contains(&s.as_str()) => s.as_str(),
+            Some(ParamValue::I32(idx)) if *idx >= 0 && (*idx as usize) < spec.variant_ids.len() => {
+                spec.variant_ids[*idx as usize]
+            }
+            _ => spec.default_id,
+        };
+        clean_params.insert(spec.id.to_string(), ParamValue::String(variant_id.to_string()));
+    }
+
+    state.params = clean_params;
+    state.fields.remove("editor-state");
+}
+
+// ----------------------------------------------------------------------------
 // Main Plugin Struct
 // ----------------------------------------------------------------------------
 
@@ -1223,6 +1371,10 @@ impl Plugin for OmorePunch {
     fn reset(&mut self) {
         self.dsp.reset();
         self.telemetry.clear_gain_reduction();
+    }
+
+    fn filter_state(state: &mut PluginState) {
+        sanitize_plugin_state(state);
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
@@ -2438,13 +2590,34 @@ mod clap {
     };
     use nih_plug::wrapper::setup_logger;
     use std::ffi::{c_char, c_void, CStr};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
     use std::sync::{Arc, OnceLock};
 
     const CLAP_EXT_GAIN_ADJUSTMENT_METERING: &[u8] = b"clap.gain-adjustment-metering/0\0";
+    const CLAP_EXT_STATE: &[u8] = b"clap.state\0";
+    const CLAP_EXT_PARAMS: &[u8] = b"clap.params\0";
+    const CLAP_PARAM_RESCAN_VALUES: u32 = 1 << 0;
 
     #[repr(C)]
     pub struct ClapPluginGainAdjustmentMetering {
         pub get: Option<unsafe extern "C" fn(plugin: *const clap_plugin) -> f64>,
+    }
+
+    #[repr(C)]
+    pub struct ClapPluginState {
+        pub save: Option<
+            unsafe extern "C" fn(plugin: *const clap_plugin, stream: *const c_void) -> bool,
+        >,
+        pub load: Option<
+            unsafe extern "C" fn(plugin: *const clap_plugin, stream: *const c_void) -> bool,
+        >,
+    }
+
+    #[repr(C)]
+    pub struct ClapHostParams {
+        pub rescan: Option<unsafe extern "C" fn(host: *const clap_host, flags: u32)>,
+        pub clear: Option<unsafe extern "C" fn(host: *const clap_host, param_id: u32, flags: u32)>,
+        pub request_flush: Option<unsafe extern "C" fn(host: *const clap_host)>,
     }
 
     static CLAP_GAIN_ADJUSTMENT_METERING: ClapPluginGainAdjustmentMetering =
@@ -2452,10 +2625,16 @@ mod clap {
             get: Some(clap_gain_adjustment_get),
         };
 
+    static CLAP_STATE: ClapPluginState = ClapPluginState {
+        save: Some(clap_state_save),
+        load: Some(clap_state_load),
+    };
+
     #[repr(C)]
     struct ClapGainReductionBox {
         // Must remain the first field so `*const clap_plugin` casts cleanly to `*mut Self`.
         plugin: clap_plugin,
+        host: *const clap_host,
         inner_destroy: Option<unsafe extern "C" fn(plugin: *const clap_plugin)>,
         inner_deactivate: Option<unsafe extern "C" fn(plugin: *const clap_plugin)>,
         inner_stop_processing: Option<unsafe extern "C" fn(plugin: *const clap_plugin)>,
@@ -2463,6 +2642,8 @@ mod clap {
         inner_get_extension: Option<
             unsafe extern "C" fn(plugin: *const clap_plugin, id: *const c_char) -> *const c_void,
         >,
+        inner_state: AtomicPtr<ClapPluginState>,
+        rescanning_state: AtomicBool,
         telemetry: Arc<MeterTelemetry>,
     }
 
@@ -2471,12 +2652,79 @@ mod clap {
         DESCRIPTOR.get_or_init(PluginDescriptor::for_plugin::<OmorePunch>)
     }
 
+    #[cfg(test)]
+    pub unsafe fn test_telemetry(plugin: *const clap_plugin) -> Arc<MeterTelemetry> {
+        let boxed = &*(plugin as *const ClapGainReductionBox);
+        boxed.telemetry.clone()
+    }
+
     unsafe extern "C" fn clap_gain_adjustment_get(plugin: *const clap_plugin) -> f64 {
         if plugin.is_null() {
             return 0.0;
         }
         let boxed = &*(plugin as *const ClapGainReductionBox);
         boxed.telemetry.host_gain_reduction_db()
+    }
+
+    unsafe extern "C" fn clap_state_save(
+        plugin: *const clap_plugin,
+        stream: *const c_void,
+    ) -> bool {
+        if plugin.is_null() || stream.is_null() {
+            return false;
+        }
+        let boxed = &*(plugin as *const ClapGainReductionBox);
+        let inner_state = boxed.inner_state.load(Ordering::Acquire);
+        if inner_state.is_null() {
+            return false;
+        }
+        if let Some(save) = (*inner_state).save {
+            save(plugin, stream)
+        } else {
+            false
+        }
+    }
+
+    unsafe extern "C" fn clap_state_load(
+        plugin: *const clap_plugin,
+        stream: *const c_void,
+    ) -> bool {
+        if plugin.is_null() || stream.is_null() {
+            return false;
+        }
+        let boxed = &*(plugin as *const ClapGainReductionBox);
+        let inner_state = boxed.inner_state.load(Ordering::Acquire);
+        if inner_state.is_null() {
+            return false;
+        }
+        let Some(load) = (*inner_state).load else {
+            return false;
+        };
+
+        let loaded = load(plugin, stream);
+        if loaded {
+            // Ensure transient metering resets even if the plugin has not been activated yet.
+            boxed.telemetry.clear_gain_reduction();
+            boxed.telemetry.reset_peaks();
+
+            if !boxed.rescanning_state.swap(true, Ordering::AcqRel) {
+                if !boxed.host.is_null() {
+                    if let Some(get_host_ext) = (*boxed.host).get_extension {
+                        let host_params = get_host_ext(
+                            boxed.host,
+                            CLAP_EXT_PARAMS.as_ptr() as *const c_char,
+                        ) as *const ClapHostParams;
+                        if !host_params.is_null() {
+                            if let Some(rescan) = (*host_params).rescan {
+                                rescan(boxed.host, CLAP_PARAM_RESCAN_VALUES);
+                            }
+                        }
+                    }
+                }
+                boxed.rescanning_state.store(false, Ordering::Release);
+            }
+        }
+        loaded
     }
 
     unsafe extern "C" fn clap_destroy(plugin: *const clap_plugin) {
@@ -2530,19 +2778,28 @@ mod clap {
             return std::ptr::null();
         }
 
-        let ext_id =
-            CStr::from_bytes_with_nul_unchecked(CLAP_EXT_GAIN_ADJUSTMENT_METERING);
-        if CStr::from_ptr(id) == ext_id {
+        let requested = CStr::from_ptr(id);
+        let gr_ext_id = CStr::from_bytes_with_nul_unchecked(CLAP_EXT_GAIN_ADJUSTMENT_METERING);
+        if requested == gr_ext_id {
             return &CLAP_GAIN_ADJUSTMENT_METERING as *const ClapPluginGainAdjustmentMetering
                 as *const c_void;
         }
 
         let boxed = &*(plugin as *const ClapGainReductionBox);
-        if let Some(get_extension) = boxed.inner_get_extension {
-            get_extension(plugin, id)
-        } else {
-            std::ptr::null()
+        let Some(get_extension) = boxed.inner_get_extension else {
+            return std::ptr::null();
+        };
+
+        let inner_ext = get_extension(plugin, id);
+        let state_ext_id = CStr::from_bytes_with_nul_unchecked(CLAP_EXT_STATE);
+        if requested == state_ext_id && !inner_ext.is_null() {
+            boxed
+                .inner_state
+                .store(inner_ext as *mut ClapPluginState, Ordering::Release);
+            return &CLAP_STATE as *const ClapPluginState as *const c_void;
         }
+
+        inner_ext
     }
 
     unsafe extern "C" fn clap_get_plugin_count(_factory: *const clap_plugin_factory) -> u32 {
@@ -2596,11 +2853,14 @@ mod clap {
                 get_extension: Some(clap_get_extension),
                 on_main_thread: inner.on_main_thread,
             },
+            host,
             inner_destroy: inner.destroy,
             inner_deactivate: inner.deactivate,
             inner_stop_processing: inner.stop_processing,
             inner_reset: inner.reset,
             inner_get_extension: inner.get_extension,
+            inner_state: AtomicPtr::new(std::ptr::null_mut()),
+            rescanning_state: AtomicBool::new(false),
             telemetry,
         });
 
@@ -2652,7 +2912,8 @@ mod vst3 {
     use nih_plug::wrapper::setup_logger;
     use nih_plug::wrapper::vst3::{vst3_sys, PluginInfo, Wrapper as Vst3Wrapper};
     use std::ffi::c_void;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
     use vst3_sys as vst3_com;
     use vst3_sys::base::{
         kInvalidArgument, kNoInterface, kResultOk, tresult, FIDString, IBStream, IPluginBase,
@@ -2664,10 +2925,25 @@ mod vst3 {
         BusDirection, BusInfo, CtrlNumber, IAudioProcessor, IComponent, IComponentHandler,
         IEditController, IMidiMapping, INoteExpressionController, IProcessContextRequirements,
         IUnitInfo, IoMode, MediaType, NoteExpressionTypeInfo, ParamID, ParameterInfo,
-        ProcessData, ProcessSetup, ProgramListInfo, RoutingInfo, SpeakerArrangement, TChar,
-        UnitInfo,
+        ProcessData, ProcessSetup, ProgramListInfo, RestartFlags, RoutingInfo, SpeakerArrangement,
+        TChar, UnitInfo,
     };
-    use vst3_sys::{com_interface, IID, VST3};
+    use vst3_sys::{com_interface, IID, VstPtr, VST3};
+
+    struct ComponentHandlerPtr(VstPtr<dyn IComponentHandler>);
+    unsafe impl Send for ComponentHandlerPtr {}
+    unsafe impl Sync for ComponentHandlerPtr {}
+
+    #[cfg(test)]
+    thread_local! {
+        static TEST_LAST_VST3_TELEMETRY: std::cell::RefCell<Option<Arc<MeterTelemetry>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub fn take_test_vst3_telemetry() -> Option<Arc<MeterTelemetry>> {
+        TEST_LAST_VST3_TELEMETRY.with(|slot| slot.borrow_mut().take())
+    }
 
     #[com_interface("8E3C292C-9592-4F9D-B259-0B1E100E4198")]
     pub trait IGainReductionInfo: IUnknown {
@@ -2687,13 +2963,41 @@ mod vst3 {
     struct Vst3GainReductionProxy {
         inner: *mut Vst3Wrapper<OmorePunch>,
         telemetry: Arc<MeterTelemetry>,
+        component_handler: Mutex<Option<ComponentHandlerPtr>>,
+        restarting_params: AtomicBool,
     }
 
     unsafe impl Send for Vst3GainReductionProxy {}
     unsafe impl Sync for Vst3GainReductionProxy {}
 
+    impl Vst3GainReductionProxy {
+        fn clear_component_handler(&self) {
+            if let Ok(mut guard) = self.component_handler.lock() {
+                *guard = None;
+            }
+        }
+
+        fn notify_param_values_changed(&self) {
+            if self.restarting_params.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let handler = self
+                .component_handler
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|entry| entry.0.clone()));
+            if let Some(handler) = handler {
+                unsafe {
+                    handler.restart_component(RestartFlags::kParamValuesChanged as i32);
+                }
+            }
+            self.restarting_params.store(false, Ordering::Release);
+        }
+    }
+
     impl Drop for Vst3GainReductionProxy {
         fn drop(&mut self) {
+            self.clear_component_handler();
             unsafe {
                 if !self.inner.is_null() {
                     (*self.inner).release();
@@ -2710,6 +3014,7 @@ mod vst3 {
 
         unsafe fn terminate(&self) -> tresult {
             self.telemetry.clear_gain_reduction();
+            self.clear_component_handler();
             (*self.inner).terminate()
         }
     }
@@ -2763,7 +3068,14 @@ mod vst3 {
         }
 
         unsafe fn set_state(&self, state: SharedVstPtr<dyn IBStream>) -> tresult {
-            <Vst3Wrapper<OmorePunch> as IComponent>::set_state(&*self.inner, state)
+            let result = <Vst3Wrapper<OmorePunch> as IComponent>::set_state(&*self.inner, state);
+            if result == kResultOk {
+                // Ensure transient metering resets even when loaded before activation.
+                self.telemetry.clear_gain_reduction();
+                self.telemetry.reset_peaks();
+                self.notify_param_values_changed();
+            }
+            result
         }
 
         unsafe fn get_state(&self, state: SharedVstPtr<dyn IBStream>) -> tresult {
@@ -2834,6 +3146,10 @@ mod vst3 {
             &self,
             handler: SharedVstPtr<dyn IComponentHandler>,
         ) -> tresult {
+            let upgraded = handler.upgrade().map(ComponentHandlerPtr);
+            if let Ok(mut guard) = self.component_handler.lock() {
+                *guard = upgraded;
+            }
             (*self.inner).set_component_handler(handler)
         }
 
@@ -3088,10 +3404,21 @@ mod vst3 {
             let _ = take_last_created_telemetry();
             let inner = Box::into_raw(Vst3Wrapper::<OmorePunch>::new());
             let telemetry = take_last_created_telemetry().unwrap_or_default();
+            #[cfg(test)]
+            let test_telemetry = telemetry.clone();
 
-            let proxy = Vst3GainReductionProxy::allocate(inner, telemetry);
+            let proxy = Vst3GainReductionProxy::allocate(
+                inner,
+                telemetry,
+                Mutex::new(None),
+                AtomicBool::new(false),
+            );
             let result = proxy.query_interface(&*iid, obj);
             if result == kResultOk {
+                #[cfg(test)]
+                TEST_LAST_VST3_TELEMETRY.with(|slot| {
+                    *slot.borrow_mut() = Some(test_telemetry);
+                });
                 proxy.release();
                 std::mem::forget(proxy);
                 kResultOk
@@ -5879,5 +6206,1086 @@ mod tests {
         fn set_latency_samples(&self, _samples: u32) {}
 
         fn set_current_voice_capacity(&self, _capacity: u32) {}
+    }
+
+    const PRESET_A_JSON: &str = concat!(
+        r#"{"version":"0.3.1-dev","params":{"#,
+        r#""attack_ms":{"f32":12.5},"#,
+        r#""auto_makeup":{"bool":false},"#,
+        r#""ceiling_db":{"f32":-1.5},"#,
+        r#""clipper_mode":{"string":"hard_clip"},"#,
+        r#""eq_high_shelf_db":{"f32":4.5},"#,
+        r#""eq_low_cut_hz":{"f32":75.0},"#,
+        r#""eq_mid_cut_db":{"f32":-3.5},"#,
+        r#""gain_match":{"bool":true},"#,
+        r#""input_db":{"f32":3.25},"#,
+        r#""makeup_db":{"f32":6.0},"#,
+        r#""mix_pct":{"f32":65.0},"#,
+        r#""ratio":{"f32":8.0},"#,
+        r#""release_mode":{"string":"auto_punch"},"#,
+        r#""release_ms":{"f32":145.0},"#,
+        r#""sc_hpf_hz":{"f32":200.0},"#,
+        r#""threshold_db":{"f32":-18.5}"#,
+        r#"},"fields":{}}"#
+    );
+
+    const PRESET_B_JSON: &str = concat!(
+        r#"{"version":"0.3.1-dev","params":{"#,
+        r#""attack_ms":{"f32":0.5},"#,
+        r#""auto_makeup":{"bool":true},"#,
+        r#""ceiling_db":{"f32":-4.0},"#,
+        r#""clipper_mode":{"string":"bypass_clip"},"#,
+        r#""eq_high_shelf_db":{"f32":-2.5},"#,
+        r#""eq_low_cut_hz":{"f32":35.0},"#,
+        r#""eq_mid_cut_db":{"f32":-8.0},"#,
+        r#""gain_match":{"bool":false},"#,
+        r#""input_db":{"f32":-4.0},"#,
+        r#""makeup_db":{"f32":2.0},"#,
+        r#""mix_pct":{"f32":35.0},"#,
+        r#""ratio":{"f32":2.5},"#,
+        r#""release_mode":{"string":"auto_glue"},"#,
+        r#""release_ms":{"f32":320.0},"#,
+        r#""sc_hpf_hz":{"f32":60.0},"#,
+        r#""threshold_db":{"f32":-8.0}"#,
+        r#"},"fields":{}}"#
+    );
+
+    const LEGACY_V02_PRESET_JSON: &str = concat!(
+        r#"{"version":"0.2.0","params":{"#,
+        r#""input_db":{"f32":2.0},"#,
+        r#""threshold_db":{"f32":-16.0},"#,
+        r#""ratio":{"f32":6.0},"#,
+        r#""attack_ms":{"f32":5.0},"#,
+        r#""release_ms":{"f32":110.0},"#,
+        r#""sc_hpf_hz":{"f32":120.0},"#,
+        r#""auto_makeup":{"bool":false},"#,
+        r#""makeup_db":{"f32":3.0},"#,
+        r#""clipper_mode":{"string":"hard_clip"},"#,
+        r#""ceiling_db":{"f32":-2.0},"#,
+        r#""mix_pct":{"f32":70.0}"#,
+        r#"},"fields":{"editor-state":"{\"size\":[820,480]}"}}"#
+    );
+
+    fn encode_clap_state_chunk(json: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + json.len());
+        out.extend_from_slice(&(json.len() as u64).to_le_bytes());
+        out.extend_from_slice(json);
+        out
+    }
+
+    #[repr(C)]
+    struct TestClapOStream {
+        ctx: *mut std::ffi::c_void,
+        write: Option<
+            unsafe extern "C" fn(
+                stream: *const TestClapOStream,
+                buffer: *const std::ffi::c_void,
+                size: u64,
+            ) -> i64,
+        >,
+    }
+
+    #[repr(C)]
+    struct TestClapIStream {
+        ctx: *mut std::ffi::c_void,
+        read: Option<
+            unsafe extern "C" fn(
+                stream: *const TestClapIStream,
+                buffer: *mut std::ffi::c_void,
+                size: u64,
+            ) -> i64,
+        >,
+    }
+
+    struct ClapWriteBuffer {
+        bytes: Vec<u8>,
+    }
+
+    struct ClapReadCursor<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+    }
+
+    unsafe extern "C" fn test_clap_ostream_write(
+        stream: *const TestClapOStream,
+        buffer: *const std::ffi::c_void,
+        size: u64,
+    ) -> i64 {
+        if stream.is_null() || buffer.is_null() {
+            return -1;
+        }
+        let sink = &mut *((*stream).ctx as *mut ClapWriteBuffer);
+        let slice = std::slice::from_raw_parts(buffer as *const u8, size as usize);
+        sink.bytes.extend_from_slice(slice);
+        size as i64
+    }
+
+    unsafe extern "C" fn test_clap_istream_read(
+        stream: *const TestClapIStream,
+        buffer: *mut std::ffi::c_void,
+        size: u64,
+    ) -> i64 {
+        if stream.is_null() || buffer.is_null() {
+            return -1;
+        }
+        let cursor = &mut *((*stream).ctx as *mut ClapReadCursor<'_>);
+        let remaining = cursor.bytes.len().saturating_sub(cursor.pos);
+        let count = remaining.min(size as usize);
+        if count > 0 {
+            std::ptr::copy_nonoverlapping(
+                cursor.bytes.as_ptr().add(cursor.pos),
+                buffer as *mut u8,
+                count,
+            );
+            cursor.pos += count;
+        }
+        count as i64
+    }
+
+    struct ClapHostRescanTracker {
+        rescan_calls: AtomicU32,
+        last_rescan_flags: AtomicU32,
+    }
+
+    unsafe extern "C" fn test_clap_host_params_rescan(
+        host: *const nih_plug::wrapper::clap::clap_host,
+        flags: u32,
+    ) {
+        if host.is_null() || (*host).host_data.is_null() {
+            return;
+        }
+        let tracker = &*((*host).host_data as *const ClapHostRescanTracker);
+        tracker.rescan_calls.fetch_add(1, Ordering::SeqCst);
+        tracker.last_rescan_flags.store(flags, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" fn test_clap_host_params_clear(
+        _host: *const nih_plug::wrapper::clap::clap_host,
+        _param_id: u32,
+        _flags: u32,
+    ) {
+    }
+
+    static TEST_CLAP_HOST_PARAMS_EXT: super::clap::ClapHostParams = super::clap::ClapHostParams {
+        rescan: Some(test_clap_host_params_rescan),
+        clear: Some(test_clap_host_params_clear),
+        request_flush: Some(test_clap_host_noop),
+    };
+
+    unsafe extern "C" fn test_clap_host_get_extension_with_params(
+        _host: *const nih_plug::wrapper::clap::clap_host,
+        extension_id: *const std::ffi::c_char,
+    ) -> *const std::ffi::c_void {
+        if extension_id.is_null() {
+            return std::ptr::null();
+        }
+        if std::ffi::CStr::from_ptr(extension_id).to_bytes_with_nul() == b"clap.params\0" {
+            &TEST_CLAP_HOST_PARAMS_EXT as *const super::clap::ClapHostParams
+                as *const std::ffi::c_void
+        } else {
+            std::ptr::null()
+        }
+    }
+
+    mod vst3_test_mocks {
+        use nih_plug::wrapper::vst3::vst3_sys;
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+        use std::sync::Mutex;
+        use vst3_sys as vst3_com;
+        use vst3_sys::base::{
+            kIBSeekCur, kIBSeekEnd, kIBSeekSet, kInvalidArgument, kResultOk, tresult, IBStream,
+            IUnknown,
+        };
+        use vst3_sys::utils::SharedVstPtr;
+        use vst3_sys::vst::{IComponentHandler, ParamID, ParamValue};
+        use vst3_sys::{ComInterface, VstPtr, VST3};
+
+        #[VST3(implements(IBStream))]
+        pub struct MockVst3Stream {
+            buf: Mutex<(Vec<u8>, usize)>,
+        }
+
+        impl MockVst3Stream {
+            pub fn new_empty() -> VstPtr<dyn IBStream> {
+                Self::from_bytes(Vec::new())
+            }
+
+            pub fn from_bytes(bytes: Vec<u8>) -> VstPtr<dyn IBStream> {
+                let raw_box = Self::allocate(Mutex::new((bytes, 0)));
+                let mut obj = std::ptr::null_mut();
+                unsafe {
+                    assert_eq!(raw_box.query_interface(&<dyn IBStream>::IID, &mut obj), kResultOk);
+                    raw_box.release();
+                    std::mem::forget(raw_box);
+                    VstPtr::<dyn IBStream>::owned(obj as *mut *mut _).unwrap()
+                }
+            }
+
+            pub fn rewind(stream: &VstPtr<dyn IBStream>) {
+                unsafe {
+                    assert_eq!(stream.seek(0, kIBSeekSet, std::ptr::null_mut()), kResultOk);
+                }
+            }
+        }
+
+        impl IBStream for MockVst3Stream {
+            unsafe fn read(
+                &self,
+                buffer: *mut c_void,
+                num_bytes: i32,
+                num_bytes_read: *mut i32,
+            ) -> tresult {
+                if buffer.is_null() || num_bytes < 0 {
+                    return kInvalidArgument;
+                }
+                let mut guard = self.buf.lock().unwrap();
+                let (ref data, ref mut pos) = *guard;
+                let available = data.len().saturating_sub(*pos);
+                let count = available.min(num_bytes as usize);
+                if count > 0 {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr().add(*pos),
+                        buffer as *mut u8,
+                        count,
+                    );
+                    *pos += count;
+                }
+                if !num_bytes_read.is_null() {
+                    *num_bytes_read = count as i32;
+                }
+                kResultOk
+            }
+
+            unsafe fn write(
+                &self,
+                buffer: *const c_void,
+                num_bytes: i32,
+                num_bytes_written: *mut i32,
+            ) -> tresult {
+                if buffer.is_null() || num_bytes < 0 {
+                    return kInvalidArgument;
+                }
+                let mut guard = self.buf.lock().unwrap();
+                let (ref mut data, ref mut pos) = *guard;
+                let slice = std::slice::from_raw_parts(buffer as *const u8, num_bytes as usize);
+                let end = *pos + slice.len();
+                if end > data.len() {
+                    data.resize(end, 0);
+                }
+                data[*pos..end].copy_from_slice(slice);
+                *pos = end;
+                if !num_bytes_written.is_null() {
+                    *num_bytes_written = slice.len() as i32;
+                }
+                kResultOk
+            }
+
+            unsafe fn seek(&self, pos: i64, mode: i32, result: *mut i64) -> tresult {
+                let mut guard = self.buf.lock().unwrap();
+                let (ref data, ref mut cursor) = *guard;
+                let base: i64 = match mode {
+                    x if x == kIBSeekSet => 0,
+                    x if x == kIBSeekCur => *cursor as i64,
+                    x if x == kIBSeekEnd => data.len() as i64,
+                    _ => return kInvalidArgument,
+                };
+                let next = base + pos;
+                if next < 0 {
+                    return kInvalidArgument;
+                }
+                *cursor = (next as usize).min(data.len());
+                if !result.is_null() {
+                    *result = *cursor as i64;
+                }
+                kResultOk
+            }
+
+            unsafe fn tell(&self, pos: *mut i64) -> tresult {
+                if pos.is_null() {
+                    return kInvalidArgument;
+                }
+                let guard = self.buf.lock().unwrap();
+                *pos = guard.1 as i64;
+                kResultOk
+            }
+        }
+
+        pub fn stream_to_bytes(stream: &VstPtr<dyn IBStream>) -> Vec<u8> {
+            unsafe {
+                let mut end_pos = 0_i64;
+                assert_eq!(stream.seek(0, kIBSeekEnd, &mut end_pos), kResultOk);
+                assert_eq!(stream.seek(0, kIBSeekSet, std::ptr::null_mut()), kResultOk);
+                let mut out = vec![0_u8; end_pos as usize];
+                let mut read_len = 0_i32;
+                assert_eq!(
+                    stream.read(out.as_mut_ptr() as *mut c_void, end_pos as i32, &mut read_len),
+                    kResultOk
+                );
+                out.truncate(read_len as usize);
+                out
+            }
+        }
+
+        pub unsafe fn to_shared_stream(
+            stream: &VstPtr<dyn IBStream>,
+        ) -> SharedVstPtr<dyn IBStream> {
+            std::mem::transmute(stream.as_ptr())
+        }
+
+        #[VST3(implements(IComponentHandler))]
+        pub struct MockComponentHandler {
+            pub restart_calls: std::sync::Arc<AtomicU32>,
+            pub last_restart_flags: std::sync::Arc<AtomicI32>,
+        }
+
+        impl MockComponentHandler {
+            pub fn new_shared(
+                restart_calls: std::sync::Arc<AtomicU32>,
+                last_restart_flags: std::sync::Arc<AtomicI32>,
+            ) -> (VstPtr<dyn IComponentHandler>, SharedVstPtr<dyn IComponentHandler>) {
+                let raw_box = Self::allocate(restart_calls, last_restart_flags);
+                let mut obj = std::ptr::null_mut();
+                unsafe {
+                    assert_eq!(
+                        raw_box.query_interface(&<dyn IComponentHandler>::IID, &mut obj),
+                        kResultOk
+                    );
+                    raw_box.release();
+                    std::mem::forget(raw_box);
+                    let ptr = VstPtr::<dyn IComponentHandler>::owned(obj as *mut *mut _).unwrap();
+                    let shared = std::mem::transmute(ptr.as_ptr());
+                    (ptr, shared)
+                }
+            }
+        }
+
+        impl IComponentHandler for MockComponentHandler {
+            unsafe fn begin_edit(&self, _id: ParamID) -> tresult {
+                kResultOk
+            }
+            unsafe fn perform_edit(&self, _id: ParamID, _value_normalized: ParamValue) -> tresult {
+                kResultOk
+            }
+            unsafe fn end_edit(&self, _id: ParamID) -> tresult {
+                kResultOk
+            }
+            unsafe fn restart_component(&self, flags: i32) -> tresult {
+                self.restart_calls.fetch_add(1, Ordering::SeqCst);
+                self.last_restart_flags.store(flags, Ordering::SeqCst);
+                kResultOk
+            }
+        }
+    }
+
+    #[test]
+    fn test_filter_state_fills_missing_legacy_params() {
+        use nih_plug::wrapper::state::ParamValue;
+        use std::collections::BTreeMap;
+
+        let mut legacy_params = BTreeMap::new();
+        legacy_params.insert("threshold_db".to_string(), ParamValue::F32(-14.0));
+        legacy_params.insert("ratio".to_string(), ParamValue::F32(6.0));
+        legacy_params.insert("auto_makeup".to_string(), ParamValue::Bool(false));
+        legacy_params.insert(
+            "clipper_mode".to_string(),
+            ParamValue::String("hard_clip".to_string()),
+        );
+
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "editor-state".to_string(),
+            r#"{"size":[820,480]}"#.to_string(),
+        );
+
+        let mut state = PluginState {
+            version: "0.2.0".to_string(),
+            params: legacy_params,
+            fields,
+        };
+        OmorePunch::filter_state(&mut state);
+
+        assert_eq!(state.params.len(), 16);
+        assert!(!state.fields.contains_key("editor-state"));
+
+        // Preserved legacy fields
+        assert!(matches!(state.params.get("threshold_db"), Some(ParamValue::F32(v)) if (*v - -14.0).abs() < 1e-6));
+        assert!(matches!(state.params.get("ratio"), Some(ParamValue::F32(v)) if (*v - 6.0).abs() < 1e-6));
+        assert!(matches!(state.params.get("auto_makeup"), Some(ParamValue::Bool(false))));
+        assert!(matches!(state.params.get("clipper_mode"), Some(ParamValue::String(s)) if s == "hard_clip"));
+
+        // Missing parameters filled with documented defaults
+        assert!(matches!(state.params.get("input_db"), Some(ParamValue::F32(v)) if *v == 0.0));
+        assert!(matches!(state.params.get("attack_ms"), Some(ParamValue::F32(v)) if *v == 3.0));
+        assert!(matches!(state.params.get("release_ms"), Some(ParamValue::F32(v)) if *v == 80.0));
+        assert!(matches!(state.params.get("release_mode"), Some(ParamValue::String(s)) if s == "manual"));
+        assert!(matches!(state.params.get("sc_hpf_hz"), Some(ParamValue::F32(v)) if *v == 20.0));
+        assert!(matches!(state.params.get("makeup_db"), Some(ParamValue::F32(v)) if *v == 0.0));
+        assert!(matches!(state.params.get("eq_low_cut_hz"), Some(ParamValue::F32(v)) if *v == 20.0));
+        assert!(matches!(state.params.get("eq_mid_cut_db"), Some(ParamValue::F32(v)) if *v == 0.0));
+        assert!(matches!(state.params.get("eq_high_shelf_db"), Some(ParamValue::F32(v)) if *v == 0.0));
+        assert!(matches!(state.params.get("ceiling_db"), Some(ParamValue::F32(v)) if *v == 0.0));
+        assert!(matches!(state.params.get("mix_pct"), Some(ParamValue::F32(v)) if *v == 100.0));
+        assert!(matches!(state.params.get("gain_match"), Some(ParamValue::Bool(false))));
+    }
+
+    #[test]
+    fn test_filter_state_clamps_out_of_range_and_nan() {
+        use nih_plug::wrapper::state::ParamValue;
+        use std::collections::BTreeMap;
+
+        let mut params = BTreeMap::new();
+        params.insert("input_db".to_string(), ParamValue::F32(999.0));
+        params.insert("threshold_db".to_string(), ParamValue::F32(-120.0));
+        params.insert("ratio".to_string(), ParamValue::F32(f32::NAN));
+        params.insert("attack_ms".to_string(), ParamValue::F32(0.0));
+        params.insert("release_ms".to_string(), ParamValue::F32(f32::INFINITY));
+        params.insert("sc_hpf_hz".to_string(), ParamValue::F32(1000.0));
+        params.insert("makeup_db".to_string(), ParamValue::F32(-50.0));
+        params.insert("eq_low_cut_hz".to_string(), ParamValue::F32(-10.0));
+        params.insert("eq_mid_cut_db".to_string(), ParamValue::F32(5.0));
+        params.insert("eq_high_shelf_db".to_string(), ParamValue::F32(f32::NEG_INFINITY));
+        params.insert("ceiling_db".to_string(), ParamValue::F32(3.0));
+        params.insert("mix_pct".to_string(), ParamValue::F32(150.0));
+
+        let mut state = PluginState {
+            version: "0.3.1-dev".to_string(),
+            params,
+            fields: BTreeMap::new(),
+        };
+        sanitize_plugin_state(&mut state);
+
+        assert!(matches!(state.params.get("input_db"), Some(ParamValue::F32(v)) if *v == 12.0));
+        assert!(matches!(state.params.get("threshold_db"), Some(ParamValue::F32(v)) if *v == -40.0));
+        assert!(matches!(state.params.get("ratio"), Some(ParamValue::F32(v)) if *v == 4.0));
+        assert!(matches!(state.params.get("attack_ms"), Some(ParamValue::F32(v)) if *v == 0.1));
+        assert!(matches!(state.params.get("release_ms"), Some(ParamValue::F32(v)) if *v == 80.0));
+        assert!(matches!(state.params.get("sc_hpf_hz"), Some(ParamValue::F32(v)) if *v == 250.0));
+        assert!(matches!(state.params.get("makeup_db"), Some(ParamValue::F32(v)) if *v == -12.0));
+        assert!(matches!(state.params.get("eq_low_cut_hz"), Some(ParamValue::F32(v)) if *v == 20.0));
+        assert!(matches!(state.params.get("eq_mid_cut_db"), Some(ParamValue::F32(v)) if *v == 0.0));
+        assert!(matches!(state.params.get("eq_high_shelf_db"), Some(ParamValue::F32(v)) if *v == 0.0));
+        assert!(matches!(state.params.get("ceiling_db"), Some(ParamValue::F32(v)) if *v == 0.0));
+        assert!(matches!(state.params.get("mix_pct"), Some(ParamValue::F32(v)) if *v == 100.0));
+    }
+
+    #[test]
+    fn test_filter_state_normalizes_enums_and_strips_unknowns() {
+        use nih_plug::wrapper::state::ParamValue;
+        use std::collections::BTreeMap;
+
+        let mut params = BTreeMap::new();
+        params.insert("release_mode".to_string(), ParamValue::I32(2));
+        params.insert(
+            "clipper_mode".to_string(),
+            ParamValue::String("invalid_clip_mode".to_string()),
+        );
+        params.insert("auto_makeup".to_string(), ParamValue::I32(99));
+        params.insert("gain_match".to_string(), ParamValue::F32(1.0));
+        params.insert("gr_meter_db".to_string(), ParamValue::F32(-5.0));
+        params.insert("unknown_future_param".to_string(), ParamValue::Bool(true));
+
+        let mut state = PluginState {
+            version: "0.3.0".to_string(),
+            params,
+            fields: BTreeMap::new(),
+        };
+        sanitize_plugin_state(&mut state);
+
+        assert!(!state.params.contains_key("gr_meter_db"));
+        assert!(!state.params.contains_key("unknown_future_param"));
+        assert!(matches!(
+            state.params.get("release_mode"),
+            Some(ParamValue::String(s)) if s == "auto_punch"
+        ));
+        assert!(matches!(
+            state.params.get("clipper_mode"),
+            Some(ParamValue::String(s)) if s == "soft_clip"
+        ));
+        assert!(matches!(state.params.get("auto_makeup"), Some(ParamValue::Bool(true))));
+        assert!(matches!(state.params.get("gain_match"), Some(ParamValue::Bool(false))));
+
+        // Out-of-bounds enum index also falls back safely to default.
+        let mut bad_idx = PluginState {
+            version: String::new(),
+            params: BTreeMap::from([("release_mode".to_string(), ParamValue::I32(42))]),
+            fields: BTreeMap::new(),
+        };
+        sanitize_plugin_state(&mut bad_idx);
+        assert!(matches!(
+            bad_idx.params.get("release_mode"),
+            Some(ParamValue::String(s)) if s == "manual"
+        ));
+    }
+
+    #[test]
+    fn test_clap_wrapper_state_roundtrip_and_host_sync() {
+        use nih_plug::prelude::Params;
+        use nih_plug::wrapper::clap::{
+            clap_host, clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID, CLAP_VERSION,
+        };
+
+        let tracker = ClapHostRescanTracker {
+            rescan_calls: AtomicU32::new(0),
+            last_rescan_flags: AtomicU32::new(0),
+        };
+        let host_name = b"ReaperPresetHost\0";
+        let host = clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: &tracker as *const ClapHostRescanTracker as *mut std::ffi::c_void,
+            name: host_name.as_ptr() as *const std::ffi::c_char,
+            vendor: std::ptr::null(),
+            url: std::ptr::null(),
+            version: std::ptr::null(),
+            get_extension: Some(test_clap_host_get_extension_with_params),
+            request_restart: Some(test_clap_host_noop),
+            request_process: Some(test_clap_host_noop),
+            request_callback: Some(test_clap_host_noop),
+        };
+
+        let default_params = OmorePunchParams::default();
+        let default_map = default_params.param_map();
+
+        unsafe {
+            assert!((super::clap::clap_entry.init.unwrap())(std::ptr::null()));
+            let factory = (super::clap::clap_entry.get_factory.unwrap())(
+                CLAP_PLUGIN_FACTORY_ID.as_ptr(),
+            ) as *const clap_plugin_factory;
+            let desc = ((*factory).get_plugin_descriptor.unwrap())(factory, 0);
+
+            let plugin_a = ((*factory).create_plugin.unwrap())(factory, &host, (*desc).id);
+            let plugin_b = ((*factory).create_plugin.unwrap())(factory, &host, (*desc).id);
+            assert!(((*plugin_a).init.unwrap())(plugin_a));
+            assert!(((*plugin_b).init.unwrap())(plugin_b));
+
+            let params_ext_a = ((*plugin_a).get_extension.unwrap())(
+                plugin_a,
+                b"clap.params\0".as_ptr() as *const std::ffi::c_char,
+            ) as *const TestClapPluginParams;
+            let params_ext_b = ((*plugin_b).get_extension.unwrap())(
+                plugin_b,
+                b"clap.params\0".as_ptr() as *const std::ffi::c_char,
+            ) as *const TestClapPluginParams;
+            let state_ext_a = ((*plugin_a).get_extension.unwrap())(
+                plugin_a,
+                b"clap.state\0".as_ptr() as *const std::ffi::c_char,
+            ) as *const super::clap::ClapPluginState;
+            let state_ext_b = ((*plugin_b).get_extension.unwrap())(
+                plugin_b,
+                b"clap.state\0".as_ptr() as *const std::ffi::c_char,
+            ) as *const super::clap::ClapPluginState;
+            assert!(!params_ext_a.is_null() && !params_ext_b.is_null());
+            assert!(!state_ext_a.is_null() && !state_ext_b.is_null());
+
+            // 1. Verify CLAP default_value matches OmorePunchParams::default() for all 16 params.
+            let count = ((*params_ext_b).count.unwrap())(plugin_b);
+            assert_eq!(count as usize, default_map.len());
+            let mut param_ids = Vec::with_capacity(count as usize);
+            for (idx, (_, ptr, _)) in default_map.iter().enumerate() {
+                let mut info: TestClapParamInfo = std::mem::zeroed();
+                assert!(((*params_ext_b).get_info.unwrap())(plugin_b, idx as u32, &mut info));
+                let expected_default =
+                    ptr.default_normalized_value() as f64 * ptr.step_count().unwrap_or(1) as f64;
+                assert!(
+                    (info.default_value - expected_default).abs() < 1e-6,
+                    "CLAP default_value mismatch at index {}: got {}, expected {}",
+                    idx,
+                    info.default_value,
+                    expected_default
+                );
+                param_ids.push(info.id);
+            }
+
+            // 2. Load Preset A into plugin_a and save via clap_plugin_state::save.
+            let preset_a_chunk = encode_clap_state_chunk(PRESET_A_JSON.as_bytes());
+            let mut cursor_a = ClapReadCursor {
+                bytes: &preset_a_chunk,
+                pos: 0,
+            };
+            let istream_a = TestClapIStream {
+                ctx: &mut cursor_a as *mut ClapReadCursor<'_> as *mut std::ffi::c_void,
+                read: Some(test_clap_istream_read),
+            };
+            assert!(((*state_ext_a).load.unwrap())(
+                plugin_a,
+                &istream_a as *const TestClapIStream as *const std::ffi::c_void
+            ));
+
+            let mut saved_sink = ClapWriteBuffer { bytes: Vec::new() };
+            let ostream_a = TestClapOStream {
+                ctx: &mut saved_sink as *mut ClapWriteBuffer as *mut std::ffi::c_void,
+                write: Some(test_clap_ostream_write),
+            };
+            assert!(((*state_ext_a).save.unwrap())(
+                plugin_a,
+                &ostream_a as *const TestClapOStream as *const std::ffi::c_void
+            ));
+
+            // 3. Load Preset B into inactive plugin_b first, seed stale telemetry latches,
+            //    then recall Preset A chunk and verify full parameter fidelity, host rescan,
+            //    and automatic latch reset (FR-008).
+            let preset_b_chunk = encode_clap_state_chunk(PRESET_B_JSON.as_bytes());
+            let mut cursor_b1 = ClapReadCursor {
+                bytes: &preset_b_chunk,
+                pos: 0,
+            };
+            let istream_b1 = TestClapIStream {
+                ctx: &mut cursor_b1 as *mut ClapReadCursor<'_> as *mut std::ffi::c_void,
+                read: Some(test_clap_istream_read),
+            };
+            assert!(((*state_ext_b).load.unwrap())(
+                plugin_b,
+                &istream_b1 as *const TestClapIStream as *const std::ffi::c_void
+            ));
+
+            let tel_b = super::clap::test_telemetry(plugin_b);
+            store_f32_relaxed(&tel_b.current_gr_db, 5.5);
+            store_f32_relaxed(&tel_b.max_gr_db, 14.2);
+            tel_b.clip_latched.store(true, Ordering::Relaxed);
+
+            let prev_rescans = tracker.rescan_calls.load(Ordering::SeqCst);
+            let mut cursor_b2 = ClapReadCursor {
+                bytes: &saved_sink.bytes,
+                pos: 0,
+            };
+            let istream_b2 = TestClapIStream {
+                ctx: &mut cursor_b2 as *mut ClapReadCursor<'_> as *mut std::ffi::c_void,
+                read: Some(test_clap_istream_read),
+            };
+            assert!(((*state_ext_b).load.unwrap())(
+                plugin_b,
+                &istream_b2 as *const TestClapIStream as *const std::ffi::c_void
+            ));
+
+            assert_eq!(tracker.rescan_calls.load(Ordering::SeqCst), prev_rescans + 1);
+            assert_eq!(tracker.last_rescan_flags.load(Ordering::SeqCst), 1);
+
+            assert_eq!(load_f32_relaxed(&tel_b.current_gr_db), 0.0);
+            assert_eq!(load_f32_relaxed(&tel_b.max_gr_db), 0.0);
+            assert!(!tel_b.clip_latched.load(Ordering::Relaxed));
+
+            for &param_id in &param_ids {
+                let mut val_a = 0.0_f64;
+                let mut val_b = 0.0_f64;
+                assert!(((*params_ext_a).get_value.unwrap())(plugin_a, param_id, &mut val_a));
+                assert!(((*params_ext_b).get_value.unwrap())(plugin_b, param_id, &mut val_b));
+                assert!(
+                    (val_a - val_b).abs() < 1e-6,
+                    "CLAP param {} mismatch after recall: A={} B={}",
+                    param_id,
+                    val_a,
+                    val_b
+                );
+            }
+
+            // 4. Malformed / truncated stream must return false cleanly without altering state.
+            let bad_chunk = encode_clap_state_chunk(b"{not-valid-json");
+            let mut bad_cursor = ClapReadCursor {
+                bytes: &bad_chunk,
+                pos: 0,
+            };
+            let bad_istream = TestClapIStream {
+                ctx: &mut bad_cursor as *mut ClapReadCursor<'_> as *mut std::ffi::c_void,
+                read: Some(test_clap_istream_read),
+            };
+            assert!(!((*state_ext_b).load.unwrap())(
+                plugin_b,
+                &bad_istream as *const TestClapIStream as *const std::ffi::c_void
+            ));
+            let empty_bytes: [u8; 0] = [];
+            let mut empty_cursor = ClapReadCursor {
+                bytes: &empty_bytes,
+                pos: 0,
+            };
+            let empty_istream = TestClapIStream {
+                ctx: &mut empty_cursor as *mut ClapReadCursor<'_> as *mut std::ffi::c_void,
+                read: Some(test_clap_istream_read),
+            };
+            assert!(!((*state_ext_b).load.unwrap())(
+                plugin_b,
+                &empty_istream as *const TestClapIStream as *const std::ffi::c_void
+            ));
+
+            ((*plugin_a).destroy.unwrap())(plugin_a);
+            ((*plugin_b).destroy.unwrap())(plugin_b);
+        }
+    }
+
+    #[test]
+    fn test_vst3_proxy_state_roundtrip_and_host_sync() {
+        use nih_plug::prelude::{Params, Vst3Plugin};
+        use nih_plug::wrapper::vst3::vst3_sys::base::{
+            kResultFalse, kResultOk, IPluginBase, IPluginFactory,
+        };
+        use nih_plug::wrapper::vst3::vst3_sys::vst::{
+            IComponent, IEditController, ParameterInfo, RestartFlags,
+        };
+        use nih_plug::wrapper::vst3::vst3_sys::{ComInterface, VstPtr, IID};
+        use vst3_test_mocks::{
+            stream_to_bytes, to_shared_stream, MockComponentHandler, MockVst3Stream,
+        };
+
+        let default_params = OmorePunchParams::default();
+        let default_map = default_params.param_map();
+
+        unsafe {
+            let factory =
+                VstPtr::<dyn IPluginFactory>::owned(super::vst3::GetPluginFactory() as *mut *mut _)
+                    .unwrap();
+            let cid = IID {
+                data: OmorePunch::PLATFORM_VST3_CLASS_ID,
+            };
+
+            let mut raw_a = std::ptr::null_mut();
+            let mut raw_b = std::ptr::null_mut();
+            let _ = super::vst3::take_test_vst3_telemetry();
+            assert_eq!(
+                factory.create_instance(&cid, &<dyn IComponent>::IID, &mut raw_a),
+                kResultOk
+            );
+            let _tel_a = super::vst3::take_test_vst3_telemetry().expect("tel_a missing");
+            assert_eq!(
+                factory.create_instance(&cid, &<dyn IComponent>::IID, &mut raw_b),
+                kResultOk
+            );
+            let tel_b = super::vst3::take_test_vst3_telemetry().expect("tel_b missing");
+
+            let comp_a = VstPtr::<dyn IComponent>::owned(raw_a as *mut *mut _).unwrap();
+            let comp_b = VstPtr::<dyn IComponent>::owned(raw_b as *mut *mut _).unwrap();
+            let edit_a = comp_a.cast::<dyn IEditController>().unwrap();
+            let edit_b = comp_b.cast::<dyn IEditController>().unwrap();
+
+            assert_eq!(comp_a.initialize(std::ptr::null_mut()), kResultOk);
+            assert_eq!(comp_b.initialize(std::ptr::null_mut()), kResultOk);
+
+            let restart_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let last_restart_flags = Arc::new(std::sync::atomic::AtomicI32::new(0));
+            let (_handler_keepalive, handler_shared) =
+                MockComponentHandler::new_shared(restart_calls.clone(), last_restart_flags.clone());
+            assert_eq!(edit_b.set_component_handler(handler_shared), kResultOk);
+
+            // 1. Verify VST3 ParameterInfo default_normalized_value matches OmorePunchParams::default().
+            let count = edit_b.get_parameter_count();
+            assert_eq!(count as usize, default_map.len());
+            let mut param_infos = Vec::with_capacity(count as usize);
+            for (idx, (_, ptr, _)) in default_map.iter().enumerate() {
+                let mut info: ParameterInfo = std::mem::zeroed();
+                assert_eq!(edit_b.get_parameter_info(idx as i32, &mut info), kResultOk);
+                let expected_norm = ptr.default_normalized_value() as f64;
+                assert!(
+                    (info.default_normalized_value - expected_norm).abs() < 1e-6,
+                    "VST3 default_normalized_value mismatch at index {}: got {}, expected {}",
+                    idx,
+                    info.default_normalized_value,
+                    expected_norm
+                );
+                param_infos.push(info);
+            }
+
+            // 2. Load Preset A into comp_a and serialize via IComponent::get_state.
+            let stream_a_in = MockVst3Stream::from_bytes(PRESET_A_JSON.as_bytes().to_vec());
+            assert_eq!(comp_a.set_state(to_shared_stream(&stream_a_in)), kResultOk);
+
+            let stream_a_out = MockVst3Stream::new_empty();
+            assert_eq!(comp_a.get_state(to_shared_stream(&stream_a_out)), kResultOk);
+            MockVst3Stream::rewind(&stream_a_out);
+
+            // 3. Load Preset B into never-activated comp_b, seed stale latches, then recall A.
+            let stream_b_in = MockVst3Stream::from_bytes(PRESET_B_JSON.as_bytes().to_vec());
+            assert_eq!(comp_b.set_state(to_shared_stream(&stream_b_in)), kResultOk);
+
+            store_f32_relaxed(&tel_b.current_gr_db, 4.25);
+            store_f32_relaxed(&tel_b.max_gr_db, 16.0);
+            tel_b.clip_latched.store(true, Ordering::Relaxed);
+
+            // Reusing stream_a_out verifies exact IComponent::get_state -> set_state round-trip.
+            let prev_restarts = restart_calls.load(Ordering::SeqCst);
+            let saved_bytes = stream_to_bytes(&stream_a_out);
+            let stream_recall = MockVst3Stream::from_bytes(saved_bytes);
+            assert_eq!(comp_b.set_state(to_shared_stream(&stream_recall)), kResultOk);
+
+            // Verify IComponentHandler::restart_component(kParamValuesChanged) was invoked.
+            assert_eq!(restart_calls.load(Ordering::SeqCst), prev_restarts + 1);
+            assert_eq!(
+                last_restart_flags.load(Ordering::SeqCst),
+                RestartFlags::kParamValuesChanged as i32
+            );
+            assert_eq!(load_f32_relaxed(&tel_b.current_gr_db), 0.0);
+            assert_eq!(load_f32_relaxed(&tel_b.max_gr_db), 0.0);
+            assert!(!tel_b.clip_latched.load(Ordering::Relaxed));
+
+            for info in &param_infos {
+                let norm_a = edit_a.get_param_normalized(info.id);
+                let norm_b = edit_b.get_param_normalized(info.id);
+                assert!(
+                    (norm_a - norm_b).abs() < 1e-6,
+                    "VST3 param id {} mismatch after recall: A={} B={}",
+                    info.id,
+                    norm_a,
+                    norm_b
+                );
+            }
+
+            // 4. Verify Reaper-style reset-to-default via set_param_normalized restores exact defaults.
+            for info in &param_infos {
+                assert_eq!(
+                    edit_b.set_param_normalized(info.id, info.default_normalized_value),
+                    kResultOk
+                );
+                let cur = edit_b.get_param_normalized(info.id);
+                assert!(
+                    (cur - info.default_normalized_value).abs() < 1e-6,
+                    "VST3 reset to default mismatch for param id {}: got {}, expected {}",
+                    info.id,
+                    cur,
+                    info.default_normalized_value
+                );
+            }
+
+            // 5. Malformed and empty streams must fail gracefully with kResultFalse.
+            let bad_stream = MockVst3Stream::from_bytes(b"{corrupt-preset".to_vec());
+            assert_eq!(comp_b.set_state(to_shared_stream(&bad_stream)), kResultFalse);
+            let empty_stream = MockVst3Stream::new_empty();
+            assert_eq!(comp_b.set_state(to_shared_stream(&empty_stream)), kResultFalse);
+
+            // Verify handler flag constants match VST3 RestartFlags::kParamValuesChanged (1 << 2).
+            assert_eq!(RestartFlags::kParamValuesChanged as i32, 1 << 2);
+
+            assert_eq!(comp_a.terminate(), kResultOk);
+            assert_eq!(comp_b.terminate(), kResultOk);
+        }
+    }
+
+    #[test]
+    fn test_live_preset_switching_stability() {
+        use nih_plug::prelude::Vst3Plugin;
+        use nih_plug::wrapper::vst3::vst3_sys::base::{kResultOk, IPluginBase, IPluginFactory};
+        use nih_plug::wrapper::vst3::vst3_sys::vst::{
+            BusDirections, IAudioProcessor, IComponent, IEditController, MediaTypes, ProcessModes,
+            ProcessSetup, SymbolicSampleSizes,
+        };
+        use nih_plug::wrapper::vst3::vst3_sys::{ComInterface, VstPtr, IID};
+        use vst3_test_mocks::{to_shared_stream, MockVst3Stream};
+
+        let frames = 256_usize;
+        let drum_like_l: Vec<f32> = (0..frames)
+            .map(|i| {
+                let t = i as f32 / 48000.0;
+                1.4 * (2.0 * std::f32::consts::PI * 95.0 * t).sin() * (-18.0 * t).exp()
+                    + 0.4 * (2.0 * std::f32::consts::PI * 1800.0 * t).sin()
+            })
+            .collect();
+        let drum_like_r: Vec<f32> = drum_like_l.iter().map(|x| x * 0.95).collect();
+
+        let default_json = concat!(
+            r#"{"version":"0.3.1-dev","params":{"#,
+            r#""attack_ms":{"f32":3.0},"auto_makeup":{"bool":true},"#,
+            r#""ceiling_db":{"f32":0.0},"clipper_mode":{"string":"soft_clip"},"#,
+            r#""eq_high_shelf_db":{"f32":0.0},"eq_low_cut_hz":{"f32":20.0},"#,
+            r#""eq_mid_cut_db":{"f32":0.0},"gain_match":{"bool":false},"#,
+            r#""input_db":{"f32":0.0},"makeup_db":{"f32":0.0},"#,
+            r#""mix_pct":{"f32":100.0},"ratio":{"f32":4.0},"#,
+            r#""release_mode":{"string":"manual"},"release_ms":{"f32":80.0},"#,
+            r#""sc_hpf_hz":{"f32":20.0},"threshold_db":{"f32":0.0}"#,
+            r#"},"fields":{}}"#
+        );
+
+        unsafe {
+            let factory =
+                VstPtr::<dyn IPluginFactory>::owned(super::vst3::GetPluginFactory() as *mut *mut _)
+                    .unwrap();
+            let cid = IID {
+                data: OmorePunch::PLATFORM_VST3_CLASS_ID,
+            };
+            let mut raw = std::ptr::null_mut();
+            let _ = super::vst3::take_test_vst3_telemetry();
+            assert_eq!(
+                factory.create_instance(&cid, &<dyn IComponent>::IID, &mut raw),
+                kResultOk
+            );
+            let tel = super::vst3::take_test_vst3_telemetry().expect("telemetry missing");
+            let comp = VstPtr::<dyn IComponent>::owned(raw as *mut *mut _).unwrap();
+            let edit = comp.cast::<dyn IEditController>().unwrap();
+            let proc_if = comp.cast::<dyn IAudioProcessor>().unwrap();
+
+            assert_eq!(comp.initialize(std::ptr::null_mut()), kResultOk);
+            assert_eq!(
+                comp.activate_bus(MediaTypes::kAudio as i32, BusDirections::kInput as i32, 0, 1),
+                kResultOk
+            );
+            assert_eq!(
+                comp.activate_bus(MediaTypes::kAudio as i32, BusDirections::kOutput as i32, 0, 1),
+                kResultOk
+            );
+            let mut arr_in: u64 = 3;
+            let mut arr_out: u64 = 3;
+            assert_eq!(
+                proc_if.set_bus_arrangements(&mut arr_in, 1, &mut arr_out, 1),
+                kResultOk
+            );
+            let setup = ProcessSetup {
+                process_mode: ProcessModes::kRealtime as i32,
+                symbolic_sample_size: SymbolicSampleSizes::kSample32 as i32,
+                max_samples_per_block: frames as i32,
+                sample_rate: 48000.0,
+            };
+            assert_eq!(proc_if.setup_processing(&setup), kResultOk);
+            assert_eq!(comp.set_active(1), kResultOk);
+            assert_eq!(proc_if.set_processing(1), kResultOk);
+
+            let presets = [PRESET_A_JSON, PRESET_B_JSON, default_json];
+            for step in 0..10 {
+                let json = presets[step % presets.len()];
+                let stream = MockVst3Stream::from_bytes(json.as_bytes().to_vec());
+                assert_eq!(comp.set_state(to_shared_stream(&stream)), kResultOk);
+                assert_eq!(load_f32_relaxed(&tel.max_gr_db), 0.0);
+                assert!(!tel.clip_latched.load(Ordering::Relaxed));
+
+                process_vst3_stereo_block(&proc_if, &drum_like_l, &drum_like_r);
+            }
+
+            // Finish on default preset and verify all parameters match documented defaults.
+            let stream_def = MockVst3Stream::from_bytes(default_json.as_bytes().to_vec());
+            assert_eq!(comp.set_state(to_shared_stream(&stream_def)), kResultOk);
+            for idx in 0..edit.get_parameter_count() {
+                let mut info = std::mem::zeroed();
+                assert_eq!(edit.get_parameter_info(idx, &mut info), kResultOk);
+                let val = edit.get_param_normalized(info.id);
+                assert!(
+                    (val - info.default_normalized_value).abs() < 1e-6,
+                    "Default preset param {} drifted: {} != {}",
+                    idx,
+                    val,
+                    info.default_normalized_value
+                );
+            }
+
+            assert_eq!(proc_if.set_processing(0), kResultOk);
+            assert_eq!(comp.set_active(0), kResultOk);
+            assert_eq!(comp.terminate(), kResultOk);
+        }
+
+        // Also verify direct DSP switching across 10 cycles stays finite and within safety bounds.
+        let mut dsp = StereoPunchDsp::new(48000.0);
+        let cfg_a = DspConfig {
+            input_db: 3.25,
+            threshold_db: -18.5,
+            ratio: 8.0,
+            attack_ms: 12.5,
+            release_ms: 145.0,
+            release_mode: ReleaseMode::AutoPunch,
+            sc_hpf_hz: 200.0,
+            auto_makeup: false,
+            makeup_db: 6.0,
+            eq_low_cut_hz: 75.0,
+            eq_mid_cut_db: -3.5,
+            eq_high_shelf_db: 4.5,
+            clipper_mode: ClipperMode::HardClip,
+            ceiling_db: -1.5,
+            mix_pct: 65.0,
+            gain_match: true,
+        };
+        let cfg_b = DspConfig {
+            threshold_db: -8.0,
+            ratio: 2.5,
+            release_mode: ReleaseMode::AutoGlue,
+            clipper_mode: ClipperMode::Bypass,
+            ..DspConfig::default()
+        };
+        let cfg_default = DspConfig::default();
+        let cfgs = [cfg_a, cfg_b, cfg_default];
+        for step in 0..10 {
+            dsp.reset();
+            let cfg = &cfgs[step % cfgs.len()];
+            for i in 0..frames {
+                let out = dsp.process_sample(drum_like_l[i], drum_like_r[i], cfg);
+                assert!(out.out_l.is_finite() && out.out_r.is_finite());
+                assert!(out.out_l.abs() <= SAFETY_CLAMP_LIMIT);
+                assert!(out.out_r.abs() <= SAFETY_CLAMP_LIMIT);
+            }
+        }
+    }
+
+    #[test]
+    fn test_preset_json_portability_and_backward_compat() {
+        use nih_plug::prelude::Vst3Plugin;
+        use nih_plug::wrapper::vst3::vst3_sys::base::{kResultOk, IPluginBase, IPluginFactory};
+        use nih_plug::wrapper::vst3::vst3_sys::vst::{IComponent, IEditController};
+        use nih_plug::wrapper::vst3::vst3_sys::{ComInterface, VstPtr, IID};
+        use vst3_test_mocks::{stream_to_bytes, to_shared_stream, MockVst3Stream};
+
+        unsafe {
+            let factory =
+                VstPtr::<dyn IPluginFactory>::owned(super::vst3::GetPluginFactory() as *mut *mut _)
+                    .unwrap();
+            let cid = IID {
+                data: OmorePunch::PLATFORM_VST3_CLASS_ID,
+            };
+            let mut raw = std::ptr::null_mut();
+            assert_eq!(
+                factory.create_instance(&cid, &<dyn IComponent>::IID, &mut raw),
+                kResultOk
+            );
+            let comp = VstPtr::<dyn IComponent>::owned(raw as *mut *mut _).unwrap();
+            let edit = comp.cast::<dyn IEditController>().unwrap();
+            assert_eq!(comp.initialize(std::ptr::null_mut()), kResultOk);
+
+            // First load Preset A (non-default EQ/AutoRelease/GainMatch), then load legacy v0.2.0
+            // state missing those fields + containing legacy editor-state.
+            let stream_a = MockVst3Stream::from_bytes(PRESET_A_JSON.as_bytes().to_vec());
+            assert_eq!(comp.set_state(to_shared_stream(&stream_a)), kResultOk);
+
+            let stream_legacy =
+                MockVst3Stream::from_bytes(LEGACY_V02_PRESET_JSON.as_bytes().to_vec());
+            assert_eq!(comp.set_state(to_shared_stream(&stream_legacy)), kResultOk);
+
+            let out_stream = MockVst3Stream::new_empty();
+            assert_eq!(comp.get_state(to_shared_stream(&out_stream)), kResultOk);
+            let json_bytes = stream_to_bytes(&out_stream);
+            let json_str = std::str::from_utf8(&json_bytes).expect("State must be UTF-8 JSON");
+
+            // Must not persist OS/editor window state and must contain sanitized defaults for new params.
+            assert!(!json_str.contains("editor-state"));
+            assert!(json_str.contains("\"eq_low_cut_hz\":{\"f32\":20.0}"));
+            assert!(json_str.contains("\"eq_mid_cut_db\":{\"f32\":0.0}"));
+            assert!(json_str.contains("\"eq_high_shelf_db\":{\"f32\":0.0}"));
+            assert!(json_str.contains("\"release_mode\":{\"string\":\"manual\"}"));
+            assert!(json_str.contains("\"gain_match\":{\"bool\":false}"));
+            // Preserved legacy threshold (-16 dB) and ratio (6.0).
+            assert!(json_str.contains("\"threshold_db\":{\"f32\":-16.0}"));
+            assert!(json_str.contains("\"ratio\":{\"f32\":6.0}"));
+
+            // Exporting and importing into a second fresh instance produces identical JSON.
+            let mut raw_b = std::ptr::null_mut();
+            assert_eq!(
+                factory.create_instance(&cid, &<dyn IComponent>::IID, &mut raw_b),
+                kResultOk
+            );
+            let comp_b = VstPtr::<dyn IComponent>::owned(raw_b as *mut *mut _).unwrap();
+            let edit_b = comp_b.cast::<dyn IEditController>().unwrap();
+            assert_eq!(comp_b.initialize(std::ptr::null_mut()), kResultOk);
+
+            let import_stream = MockVst3Stream::from_bytes(json_bytes.clone());
+            assert_eq!(
+                comp_b.set_state(to_shared_stream(&import_stream)),
+                kResultOk
+            );
+            let out_stream_b = MockVst3Stream::new_empty();
+            assert_eq!(comp_b.get_state(to_shared_stream(&out_stream_b)), kResultOk);
+            assert_eq!(stream_to_bytes(&out_stream_b), json_bytes);
+
+            for idx in 0..edit.get_parameter_count() {
+                let mut info = std::mem::zeroed();
+                assert_eq!(edit.get_parameter_info(idx, &mut info), kResultOk);
+                assert!(
+                    (edit.get_param_normalized(info.id) - edit_b.get_param_normalized(info.id))
+                        .abs()
+                        < 1e-6
+                );
+            }
+
+            assert_eq!(comp.terminate(), kResultOk);
+            assert_eq!(comp_b.terminate(), kResultOk);
+        }
     }
 }

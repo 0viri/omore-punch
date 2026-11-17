@@ -4,6 +4,9 @@ Toutes les modifications notables de ce projet sont documentées dans ce fichier
 
 ## [Unreleased]
 ### Ajouté
+- **Support complet des presets utilisateur Reaper (`008-reaper-presets`) :**
+  - Implémentation de `Plugin::filter_state` (`sanitize_plugin_state`) pour garantir la rétrocompatibilité à 100 % des projets et presets antérieurs (remplissage des paramètres absents par leurs valeurs par défaut, bornage strict des flottants hors limites ou non finis, normalisation des enums et nettoyage des clés obsolètes/`editor-state`).
+  - Resynchronisation explicite de Reaper après chaque chargement de preset ou d'état en **CLAP** (`clap_host_params::rescan(CLAP_PARAM_RESCAN_VALUES)`) et en **VST3** (`IComponentHandler::restart_component(RestartFlags::kParamValuesChanged)`), accompagnée de la remise à zéro automatique de `Max GR` et du témoin `CLIP` même lorsque le plugin est inactif.
 - **Metering natif de Gain Reduction DAW (`007-gain-reduction-metering`) :**
   - Exposition de la télémétrie native **VST3** (`PreSonus::IGainReductionInfo`) et **CLAP** (`clap.gain-adjustment-metering/0`) via des proxys locaux autour des wrappers `nih-plug` dans `src/lib.rs`, pour l'affichage en temps réel de la jauge jaune de réduction de gain dans les tranches de mixage Reaper (MCP/TCP) sous Linux et Windows.
   - Lecture lock-free de l'enveloppe brute du compresseur (`[-24.0, 0.0]` dB), isolée par instance et indépendante du make-up gain, de l'EQ, du clipper, du mix parallèle Dry/Wet, du Gain Match et de l'état d'ouverture de l'éditeur UI, avec remise à `0.0 dB` lors des événements de cycle de vie (`reset`, `initialize`, `set_processing(false)`, `set_active(false)`, `stop_processing`, `deactivate`).

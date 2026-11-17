@@ -112,6 +112,7 @@ Ce fichier définit les règles d'architecture, de DSP temps réel, d'interface 
   - Une PR qui ne touche que la documentation (`*.md`, `.specify/`, `specs/`, `.claude/`, `.agents/`) ne déclenche pas la compilation CI (`paths-ignore`).
 - **Staging explicite :** Ajoute les fichiers par leur nom (`git add <fichier>...`) après avoir vérifié `git status` et `git diff --staged`. N'utilise jamais `git add -A` ni `git add .`.
 - **Messages Conventional Commits :** `<type>: <summary>` (types : `fix`, `feat`, `perf`, `refactor`, `test`, `docs`, `chore`, `ci`). Résumé à l'impératif, 72 caractères max, sans point final.
+- **Trailer `Co-Authored-By` obligatoire :** Tout commit créé par l'agent DOIT inclure en pied de message (séparé par une ligne vide) un trailer `Co-Authored-By:` avec le nom lisible de l'agent/modèle, par exemple : `Co-Authored-By: Antigravity (Gemini 4 Hydrogen) <noreply@antigravity.dev>`.
 
 ## 10. Spec-Kit sur Deux PC (Linux & Windows)
 L'utilisateur travaille sur deux PC (un PC sous Windows et un PC sous Linux). Chaque machine a son propre CLI `specify`, tandis que le dépôt enregistre une seule version Spec-Kit (`.specify/init-options.json`, `.specify/integration.json`, `.specify/integrations/*.manifest.json`).
