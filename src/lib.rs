@@ -9204,7 +9204,7 @@ mod tests {
             let vst_factory =
                 VstPtr::<dyn IPluginFactory>::owned(raw_factory as *mut *mut _).unwrap();
             let cid = IID {
-                data: OmorePunch::VST3_CLASS_ID,
+                data: OmorePunch::PLATFORM_VST3_CLASS_ID,
             };
             let mut raw_comp: *mut std::ffi::c_void = std::ptr::null_mut();
             assert_eq!(
