@@ -27,6 +27,7 @@ const GAIN_MATCH_NOISE_FLOOR_POWER: f32 = 1.0e-6;
 const GAIN_MATCH_MIN_DB: f32 = -24.0;
 const GAIN_MATCH_MAX_DB: f32 = 24.0;
 const BYPASS_RAMP_MS: f32 = 10.0;
+const METER_PEAK_RELEASE_MS: f32 = 85.0;
 
 // ----------------------------------------------------------------------------
 // Helper Functions for Lock-Free Atomic f32 Storage
@@ -1006,6 +1007,25 @@ impl MeterTelemetry {
     pub fn clear_gain_reduction(&self) {
         store_f32_relaxed(&self.current_gr_db, 0.0);
     }
+
+    /// Clears live instantaneous meters (GR and stereo In/Out peaks) back to `0.0`
+    /// when audio stops without resetting Gain Match DSP state.
+    #[inline(always)]
+    pub fn clear_live_meters(&self) {
+        self.clear_gain_reduction();
+        store_f32_relaxed(&self.in_peak_l, 0.0);
+        store_f32_relaxed(&self.in_peak_r, 0.0);
+        store_f32_relaxed(&self.out_peak_l, 0.0);
+        store_f32_relaxed(&self.out_peak_r, 0.0);
+    }
+
+    /// Clears live meters, gain reduction, and Gain Match trim readout back to `0.0`
+    /// on lifecycle resets, deactivation, or state loads.
+    #[inline(always)]
+    pub fn clear_lifecycle_telemetry(&self) {
+        self.clear_live_meters();
+        store_f32_relaxed(&self.gain_match_db, 0.0);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1412,10 +1432,57 @@ fn take_last_inspectable_telemetry() -> Option<Arc<MeterTelemetry>> {
     LAST_INSPECTABLE_TELEMETRY.with(|slot| slot.borrow_mut().take())
 }
 
+/// Per-sample peak meter ballistics for the stereo In/Out UI meters
+/// (index order: In L, In R, Out L, Out R).
+///
+/// The decay coefficient is precomputed outside `process()`, so the release curve is
+/// identical whatever the host buffer size or sample rate. Each audio block publishes
+/// the maximum envelope value reached during the block, so a transient is never
+/// under-reported, even when it lands at the start of a large buffer.
+#[derive(Clone, Debug)]
+struct PeakMeterBallistics {
+    decay_coeff: f32,
+    env: [f32; 4],
+}
+
+impl PeakMeterBallistics {
+    fn new(sample_rate: f32) -> Self {
+        let mut meters = Self {
+            decay_coeff: 0.0,
+            env: [0.0; 4],
+        };
+        meters.set_sample_rate(sample_rate);
+        meters
+    }
+
+    /// Recomputes the decay coefficient from an already sanitized sample rate
+    /// (never called from `process()`).
+    fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.decay_coeff =
+            StereoPunchDsp::exp_coeff_from_ms(METER_PEAK_RELEASE_MS, sample_rate, 0.001);
+    }
+
+    #[inline(always)]
+    fn reset(&mut self) {
+        self.env = [0.0; 4];
+    }
+
+    /// Advances the four envelopes by one sample and folds them into `block_max`.
+    #[inline(always)]
+    fn tick(&mut self, values: [f32; 4], block_max: &mut [f32; 4]) {
+        for idx in 0..4 {
+            let next = flush_denormal((self.env[idx] * self.decay_coeff).max(values[idx].abs()));
+            self.env[idx] = next;
+            block_max[idx] = block_max[idx].max(next);
+        }
+    }
+}
+
 pub struct OmorePunch {
     params: Arc<OmorePunchParams>,
     editor_state: Arc<EguiState>,
     dsp: StereoPunchDsp,
+    meters: PeakMeterBallistics,
     telemetry: Arc<MeterTelemetry>,
 }
 
@@ -1429,10 +1496,13 @@ impl Default for OmorePunch {
         LAST_INSPECTABLE_TELEMETRY.with(|slot| {
             *slot.borrow_mut() = Some(telemetry.clone());
         });
+        let dsp = StereoPunchDsp::default();
+        let meters = PeakMeterBallistics::new(dsp.sample_rate);
         Self {
             params: Arc::new(OmorePunchParams::default()),
             editor_state: EguiState::from_size(UI_WINDOW_WIDTH, UI_WINDOW_HEIGHT),
-            dsp: StereoPunchDsp::default(),
+            dsp,
+            meters,
             telemetry,
         }
     }
@@ -1480,9 +1550,11 @@ impl Plugin for OmorePunch {
         _context: &mut impl InitContext<Self>,
     ) -> bool {
         self.dsp.set_sample_rate(buffer_config.sample_rate);
+        self.meters.set_sample_rate(self.dsp.sample_rate);
+        self.meters.reset();
         self.dsp.reset();
         self.dsp.sync_bypass_state(self.params.bypass.value());
-        self.telemetry.clear_gain_reduction();
+        self.telemetry.clear_lifecycle_telemetry();
         self.telemetry.reset_peaks();
         true
     }
@@ -1490,7 +1562,8 @@ impl Plugin for OmorePunch {
     fn reset(&mut self) {
         self.dsp.reset();
         self.dsp.sync_bypass_state(self.params.bypass.value());
-        self.telemetry.clear_gain_reduction();
+        self.meters.reset();
+        self.telemetry.clear_lifecycle_telemetry();
     }
 
     fn filter_state(state: &mut PluginState) {
@@ -1517,10 +1590,8 @@ impl Plugin for OmorePunch {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let mut block_in_l = 0.0_f32;
-        let mut block_in_r = 0.0_f32;
-        let mut block_out_l = 0.0_f32;
-        let mut block_out_r = 0.0_f32;
+        let mut meter_block_max = [0.0_f32; 4];
+        let mut meter_frames_seen = false;
         let mut block_max_gr = 0.0_f32;
         let mut block_clipped = false;
         let mut block_active = false;
@@ -1568,16 +1639,16 @@ impl Plugin for OmorePunch {
             let clean_in_l = sanitize_sample(raw_l);
             let clean_in_r = sanitize_sample(raw_r);
 
-            block_in_l = block_in_l.max(clean_in_l.abs());
-            block_in_r = block_in_r.max(clean_in_r.abs());
-
             let out = self.dsp.process_sample(clean_in_l, clean_in_r, &cfg);
 
             *channel_samples.get_mut(0).unwrap() = out.out_l;
             *channel_samples.get_mut(1).unwrap() = out.out_r;
 
-            block_out_l = block_out_l.max(out.out_l.abs());
-            block_out_r = block_out_r.max(out.out_r.abs());
+            self.meters.tick(
+                [clean_in_l, clean_in_r, out.out_l, out.out_r],
+                &mut meter_block_max,
+            );
+            meter_frames_seen = true;
             if !bypass {
                 block_max_gr = block_max_gr.max(out.gr_db);
                 if out.clipped {
@@ -1586,16 +1657,17 @@ impl Plugin for OmorePunch {
             }
         }
 
-        // Smooth decay for UI meters between audio blocks
-        let prev_in_l = load_f32_relaxed(&self.telemetry.in_peak_l) * 0.88;
-        let prev_in_r = load_f32_relaxed(&self.telemetry.in_peak_r) * 0.88;
-        let prev_out_l = load_f32_relaxed(&self.telemetry.out_peak_l) * 0.88;
-        let prev_out_r = load_f32_relaxed(&self.telemetry.out_peak_r) * 0.88;
-
-        store_f32_relaxed(&self.telemetry.in_peak_l, block_in_l.max(prev_in_l));
-        store_f32_relaxed(&self.telemetry.in_peak_r, block_in_r.max(prev_in_r));
-        store_f32_relaxed(&self.telemetry.out_peak_l, block_out_l.max(prev_out_l));
-        store_f32_relaxed(&self.telemetry.out_peak_r, block_out_r.max(prev_out_r));
+        // Publish the true per-block meter peak (maximum envelope reached in the block);
+        // an empty block republishes the current envelope unchanged.
+        let meter_display = if meter_frames_seen {
+            meter_block_max
+        } else {
+            self.meters.env
+        };
+        store_f32_relaxed(&self.telemetry.in_peak_l, meter_display[0]);
+        store_f32_relaxed(&self.telemetry.in_peak_r, meter_display[1]);
+        store_f32_relaxed(&self.telemetry.out_peak_l, meter_display[2]);
+        store_f32_relaxed(&self.telemetry.out_peak_r, meter_display[3]);
         let reported_gr = if block_active && !last_bypass {
             self.dsp.env_gr_db
         } else {
@@ -2892,7 +2964,7 @@ mod clap {
         let loaded = load(plugin, stream);
         if loaded {
             // Ensure transient metering resets even if the plugin has not been activated yet.
-            boxed.telemetry.clear_gain_reduction();
+            boxed.telemetry.clear_lifecycle_telemetry();
             boxed.telemetry.reset_peaks();
 
             if !boxed.rescanning_state.swap(true, Ordering::AcqRel) {
@@ -2930,7 +3002,7 @@ mod clap {
             return;
         }
         let boxed = &*(plugin as *const ClapGainReductionBox);
-        boxed.telemetry.clear_gain_reduction();
+        boxed.telemetry.clear_lifecycle_telemetry();
         if let Some(deactivate) = boxed.inner_deactivate {
             deactivate(plugin);
         }
@@ -2941,7 +3013,7 @@ mod clap {
             return;
         }
         let boxed = &*(plugin as *const ClapGainReductionBox);
-        boxed.telemetry.clear_gain_reduction();
+        boxed.telemetry.clear_live_meters();
         if let Some(stop_processing) = boxed.inner_stop_processing {
             stop_processing(plugin);
         }
@@ -2952,7 +3024,7 @@ mod clap {
             return;
         }
         let boxed = &*(plugin as *const ClapGainReductionBox);
-        boxed.telemetry.clear_gain_reduction();
+        boxed.telemetry.clear_lifecycle_telemetry();
         if let Some(reset) = boxed.inner_reset {
             reset(plugin);
         }
@@ -3201,7 +3273,7 @@ mod vst3 {
         }
 
         unsafe fn terminate(&self) -> tresult {
-            self.telemetry.clear_gain_reduction();
+            self.telemetry.clear_lifecycle_telemetry();
             self.clear_component_handler();
             (*self.inner).terminate()
         }
@@ -3250,7 +3322,7 @@ mod vst3 {
 
         unsafe fn set_active(&self, state: TBool) -> tresult {
             if state == 0 {
-                self.telemetry.clear_gain_reduction();
+                self.telemetry.clear_lifecycle_telemetry();
             }
             (*self.inner).set_active(state)
         }
@@ -3259,7 +3331,7 @@ mod vst3 {
             let result = <Vst3Wrapper<OmorePunch> as IComponent>::set_state(&*self.inner, state);
             if result == kResultOk {
                 // Ensure transient metering resets even when loaded before activation.
-                self.telemetry.clear_gain_reduction();
+                self.telemetry.clear_lifecycle_telemetry();
                 self.telemetry.reset_peaks();
                 self.notify_param_values_changed();
             }
@@ -3380,7 +3452,7 @@ mod vst3 {
 
         unsafe fn set_processing(&self, state: TBool) -> tresult {
             if state == 0 {
-                self.telemetry.clear_gain_reduction();
+                self.telemetry.clear_live_meters();
             }
             (*self.inner).set_processing(state)
         }
@@ -8094,6 +8166,11 @@ mod tests {
             store_f32_relaxed(&tel_b.current_gr_db, 5.5);
             store_f32_relaxed(&tel_b.max_gr_db, 14.2);
             tel_b.clip_latched.store(true, Ordering::Relaxed);
+            store_f32_relaxed(&tel_b.in_peak_l, 0.7);
+            store_f32_relaxed(&tel_b.in_peak_r, 0.6);
+            store_f32_relaxed(&tel_b.out_peak_l, 0.5);
+            store_f32_relaxed(&tel_b.out_peak_r, 0.4);
+            store_f32_relaxed(&tel_b.gain_match_db, -2.75);
 
             let prev_rescans = tracker.rescan_calls.load(Ordering::SeqCst);
             let mut cursor_b2 = ClapReadCursor {
@@ -8115,6 +8192,16 @@ mod tests {
             assert_eq!(load_f32_relaxed(&tel_b.current_gr_db), 0.0);
             assert_eq!(load_f32_relaxed(&tel_b.max_gr_db), 0.0);
             assert!(!tel_b.clip_latched.load(Ordering::Relaxed));
+            // State load also clears live In/Out meters and the Gain Match trim readout
+            for v in [
+                load_f32_relaxed(&tel_b.in_peak_l),
+                load_f32_relaxed(&tel_b.in_peak_r),
+                load_f32_relaxed(&tel_b.out_peak_l),
+                load_f32_relaxed(&tel_b.out_peak_r),
+                load_f32_relaxed(&tel_b.gain_match_db),
+            ] {
+                assert_eq!(v.to_bits(), 0.0_f32.to_bits());
+            }
 
             for &param_id in &param_ids {
                 let mut val_a = 0.0_f64;
@@ -8249,6 +8336,11 @@ mod tests {
             store_f32_relaxed(&tel_b.current_gr_db, 4.25);
             store_f32_relaxed(&tel_b.max_gr_db, 16.0);
             tel_b.clip_latched.store(true, Ordering::Relaxed);
+            store_f32_relaxed(&tel_b.in_peak_l, 0.7);
+            store_f32_relaxed(&tel_b.in_peak_r, 0.6);
+            store_f32_relaxed(&tel_b.out_peak_l, 0.5);
+            store_f32_relaxed(&tel_b.out_peak_r, 0.4);
+            store_f32_relaxed(&tel_b.gain_match_db, -2.75);
 
             // Reusing stream_a_out verifies exact IComponent::get_state -> set_state round-trip.
             let prev_restarts = restart_calls.load(Ordering::SeqCst);
@@ -8265,6 +8357,16 @@ mod tests {
             assert_eq!(load_f32_relaxed(&tel_b.current_gr_db), 0.0);
             assert_eq!(load_f32_relaxed(&tel_b.max_gr_db), 0.0);
             assert!(!tel_b.clip_latched.load(Ordering::Relaxed));
+            // State load also clears live In/Out meters and the Gain Match trim readout
+            for v in [
+                load_f32_relaxed(&tel_b.in_peak_l),
+                load_f32_relaxed(&tel_b.in_peak_r),
+                load_f32_relaxed(&tel_b.out_peak_l),
+                load_f32_relaxed(&tel_b.out_peak_r),
+                load_f32_relaxed(&tel_b.gain_match_db),
+            ] {
+                assert_eq!(v.to_bits(), 0.0_f32.to_bits());
+            }
 
             for info in &param_infos {
                 let norm_a = edit_a.get_param_normalized(info.id);
@@ -8688,5 +8790,447 @@ mod tests {
         }
         let out = guard_dsp.process_sample(0.4, -0.4, &cfg);
         assert!(out.out_l.is_finite() && out.out_r.is_finite());
+    }
+
+    #[test]
+    fn test_peak_meter_ballistics_block_peak_and_segmentation_invariance() {
+        for &sr in &[44100.0_f32, 48000.0, 96000.0, 192000.0] {
+            let tau_samples = METER_PEAK_RELEASE_MS * 0.001 * sr;
+
+            // Test signal: transients at varied positions (block starts, middles, ends)
+            let total = (0.25 * sr) as usize;
+            let mut sig = vec![0.0_f32; total];
+            for (k, pos) in [0_usize, 511, 1000, 2047, 3001, 7777, 9000].iter().enumerate() {
+                if *pos < total {
+                    sig[*pos] = if k % 2 == 0 { 0.9 } else { -0.55 };
+                }
+            }
+
+            // Single-sample reference envelope
+            let mut reference = PeakMeterBallistics::new(sr);
+            let mut ref_env = Vec::with_capacity(total);
+            let mut scratch = [0.0_f32; 4];
+            for &s in &sig {
+                reference.tick([s, s, s, s], &mut scratch);
+                ref_env.push(reference.env[0]);
+            }
+
+            let schedules: &[&[usize]] =
+                &[&[1], &[32], &[64], &[512], &[2048], &[17, 113, 3, 512, 29, 256, 61]];
+            for &pattern in schedules {
+                let mut meters = PeakMeterBallistics::new(sr);
+                let mut offset = 0_usize;
+                let mut step = 0_usize;
+                while offset < total {
+                    let len = pattern[step % pattern.len()].min(total - offset);
+                    let mut block_max = [0.0_f32; 4];
+                    for n in offset..offset + len {
+                        let s = sig[n];
+                        meters.tick([s, s, s, s], &mut block_max);
+                    }
+                    // Published value is the true block peak of the envelope ...
+                    let expected = ref_env[offset..offset + len]
+                        .iter()
+                        .fold(0.0_f32, |acc, v| acc.max(*v));
+                    assert_eq!(block_max[0].to_bits(), expected.to_bits(), "sr={sr} {pattern:?}");
+                    // ... and never under-reports any input sample of the block.
+                    let raw_peak = sig[offset..offset + len]
+                        .iter()
+                        .fold(0.0_f32, |acc, v| acc.max(v.abs()));
+                    assert!(block_max[0] >= raw_peak, "sr={sr} {pattern:?}");
+                    offset += len;
+                    step += 1;
+                }
+                // Internal envelope is bit-identical whatever the segmentation
+                assert_eq!(meters.env[0].to_bits(), ref_env[total - 1].to_bits());
+            }
+
+            // Release calibrated in physical time: amp / e after one time constant
+            let mut decay = PeakMeterBallistics::new(sr);
+            let mut scratch = [0.0_f32; 4];
+            decay.tick([0.8; 4], &mut scratch);
+            for _ in 0..tau_samples.round() as usize {
+                decay.tick([0.0; 4], &mut scratch);
+            }
+            let expected = 0.8 * (-(tau_samples.round() / tau_samples)).exp();
+            assert!((decay.env[0] - expected).abs() < 1.0e-3, "sr={sr}: {}", decay.env[0]);
+
+            // Flush from the safety clamp ceiling to exact +0.0 within a bound derived
+            // from the constants, never passing through a subnormal value.
+            let mut flush = PeakMeterBallistics::new(sr);
+            flush.tick([SAFETY_CLAMP_LIMIT; 4], &mut scratch);
+            let bound = (tau_samples * (SAFETY_CLAMP_LIMIT / DENORMAL_FLUSH_THRESHOLD).ln() * 1.01)
+                .ceil() as usize
+                + 1;
+            let mut steps = 0_usize;
+            while flush.env[0] != 0.0 {
+                flush.tick([0.0; 4], &mut scratch);
+                assert!(flush.env[0] == 0.0 || flush.env[0].is_normal());
+                steps += 1;
+                assert!(steps <= bound, "sr={sr}: flush exceeded {bound} samples");
+            }
+            assert_eq!(flush.env, [0.0; 4]);
+        }
+    }
+
+    #[test]
+    fn test_meter_decay_buffer_size_invariance_and_lifecycle_reset() {
+        use nih_plug::wrapper::clap::{
+            clap_host, clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID, CLAP_VERSION,
+        };
+        use nih_plug::wrapper::vst3::vst3_sys::base::{kResultOk, IPluginBase, IPluginFactory};
+        use nih_plug::wrapper::vst3::vst3_sys::vst::{IAudioProcessor, IComponent};
+        use nih_plug::wrapper::vst3::vst3_sys::{ComInterface, VstPtr, IID};
+
+        // 1. Direct MeterTelemetry semantics: reset_peaks vs clear_live_meters vs clear_lifecycle_telemetry
+        let tel = MeterTelemetry::default();
+        let seed_telemetry = |t: &MeterTelemetry| {
+            store_f32_relaxed(&t.in_peak_l, 0.8);
+            store_f32_relaxed(&t.in_peak_r, 0.7);
+            store_f32_relaxed(&t.out_peak_l, 0.6);
+            store_f32_relaxed(&t.out_peak_r, 0.5);
+            store_f32_relaxed(&t.current_gr_db, 4.5);
+            store_f32_relaxed(&t.max_gr_db, 9.2);
+            store_f32_relaxed(&t.gain_match_db, 3.25);
+            t.clip_latched.store(true, Ordering::Relaxed);
+        };
+
+        seed_telemetry(&tel);
+        tel.reset_peaks();
+        assert_eq!(load_f32_relaxed(&tel.max_gr_db).to_bits(), 0.0_f32.to_bits());
+        assert!(!tel.clip_latched.load(Ordering::Relaxed));
+        assert_eq!(load_f32_relaxed(&tel.current_gr_db), 4.5);
+        assert_eq!(load_f32_relaxed(&tel.in_peak_l), 0.8);
+        assert_eq!(load_f32_relaxed(&tel.out_peak_r), 0.5);
+        assert_eq!(load_f32_relaxed(&tel.gain_match_db), 3.25);
+
+        seed_telemetry(&tel);
+        tel.clear_live_meters();
+        for v in [
+            load_f32_relaxed(&tel.current_gr_db),
+            load_f32_relaxed(&tel.in_peak_l),
+            load_f32_relaxed(&tel.in_peak_r),
+            load_f32_relaxed(&tel.out_peak_l),
+            load_f32_relaxed(&tel.out_peak_r),
+        ] {
+            assert_eq!(v.to_bits(), 0.0_f32.to_bits());
+        }
+        assert_eq!(load_f32_relaxed(&tel.gain_match_db), 3.25);
+
+        seed_telemetry(&tel);
+        tel.clear_lifecycle_telemetry();
+        for v in [
+            load_f32_relaxed(&tel.current_gr_db),
+            load_f32_relaxed(&tel.in_peak_l),
+            load_f32_relaxed(&tel.in_peak_r),
+            load_f32_relaxed(&tel.out_peak_l),
+            load_f32_relaxed(&tel.out_peak_r),
+            load_f32_relaxed(&tel.gain_match_db),
+        ] {
+            assert_eq!(v.to_bits(), 0.0_f32.to_bits());
+        }
+
+        // OmorePunch::reset() and initialize() must clear live meters and gain_match_db
+        let mut plugin = OmorePunch::default();
+        let layout = AudioIOLayout::default();
+        let mut ctx = NoopInitContext;
+        let buf_cfg = BufferConfig {
+            sample_rate: 48000.0,
+            min_buffer_size: Some(32),
+            max_buffer_size: 2048,
+            process_mode: ProcessMode::Realtime,
+        };
+        assert!(plugin.initialize(&layout, &buf_cfg, &mut ctx));
+        seed_telemetry(&plugin.telemetry);
+        plugin.meters.env = [0.9; 4];
+        plugin.reset();
+        assert_eq!(plugin.meters.env, [0.0; 4]);
+        for v in [
+            load_f32_relaxed(&plugin.telemetry.current_gr_db),
+            load_f32_relaxed(&plugin.telemetry.in_peak_l),
+            load_f32_relaxed(&plugin.telemetry.in_peak_r),
+            load_f32_relaxed(&plugin.telemetry.out_peak_l),
+            load_f32_relaxed(&plugin.telemetry.out_peak_r),
+            load_f32_relaxed(&plugin.telemetry.gain_match_db),
+        ] {
+            assert_eq!(v.to_bits(), 0.0_f32.to_bits());
+        }
+        // Simple reset keeps max_gr_db/clip_latched intact; initialize clears them too.
+        assert_eq!(load_f32_relaxed(&plugin.telemetry.max_gr_db), 9.2);
+        assert!(plugin.telemetry.clip_latched.load(Ordering::Relaxed));
+        seed_telemetry(&plugin.telemetry);
+        assert!(plugin.initialize(&layout, &buf_cfg, &mut ctx));
+        for v in [
+            load_f32_relaxed(&plugin.telemetry.current_gr_db),
+            load_f32_relaxed(&plugin.telemetry.in_peak_l),
+            load_f32_relaxed(&plugin.telemetry.in_peak_r),
+            load_f32_relaxed(&plugin.telemetry.out_peak_l),
+            load_f32_relaxed(&plugin.telemetry.out_peak_r),
+            load_f32_relaxed(&plugin.telemetry.gain_match_db),
+            load_f32_relaxed(&plugin.telemetry.max_gr_db),
+        ] {
+            assert_eq!(v.to_bits(), 0.0_f32.to_bits());
+        }
+        assert!(!plugin.telemetry.clip_latched.load(Ordering::Relaxed));
+
+        // 2. Buffer-size and sample-rate invariance of meter decay via CLAP process + lifecycle checks
+        let host_name = b"MeterTestHost\0";
+        let host_vendor = b"OmoreTest\0";
+        let host_url = b"https://example.invalid\0";
+        let host_ver = b"1.0\0";
+        let host = clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: std::ptr::null_mut(),
+            name: host_name.as_ptr() as *const std::ffi::c_char,
+            vendor: host_vendor.as_ptr() as *const std::ffi::c_char,
+            url: host_url.as_ptr() as *const std::ffi::c_char,
+            version: host_ver.as_ptr() as *const std::ffi::c_char,
+            get_extension: Some(test_clap_host_get_extension),
+            request_restart: Some(test_clap_host_noop),
+            request_process: Some(test_clap_host_noop),
+            request_callback: Some(test_clap_host_noop),
+        };
+
+        unsafe {
+            assert!((super::clap::clap_entry.init.unwrap())(std::ptr::null()));
+            let factory = (super::clap::clap_entry.get_factory.unwrap())(
+                CLAP_PLUGIN_FACTORY_ID.as_ptr(),
+            ) as *const clap_plugin_factory;
+            assert!(!factory.is_null());
+            let desc = ((*factory).get_plugin_descriptor.unwrap())(factory, 0);
+            assert!(!desc.is_null());
+
+            let amp_l = 0.45_f32;
+            let amp_r = 0.35_f32;
+
+            let schedules: &[(&str, &[usize])] = &[
+                ("fixed_64", &[64]),
+                ("fixed_512", &[512]),
+                ("fixed_2048", &[2048]),
+                ("mixed", &[17, 113, 3, 512, 29, 256, 61]),
+            ];
+
+            for &sr in &[48000.0_f64, 96000.0_f64] {
+                let total_samples = (0.1 * sr) as usize;
+                let mut sig_l = vec![0.0_f32; total_samples];
+                let mut sig_r = vec![0.0_f32; total_samples];
+                sig_l[0] = amp_l;
+                sig_r[0] = -amp_r;
+
+                // Reference envelope after the last sample, computed sample by sample
+                let mut reference = PeakMeterBallistics::new(sr as f32);
+                let mut scratch = [0.0_f32; 4];
+                for n in 0..total_samples {
+                    reference.tick([sig_l[n], sig_r[n], sig_l[n], sig_r[n]], &mut scratch);
+                }
+                let expected_end_l = reference.env[0];
+                let expected_end_r = reference.env[1];
+                // Calibrated in physical time: amp * exp(-elapsed / tau)
+                let tau_samples = (METER_PEAK_RELEASE_MS as f64) * 0.001 * sr;
+                let elapsed = (total_samples - 1) as f64;
+                let physical_l = (amp_l as f64) * (-elapsed / tau_samples).exp();
+                assert!(
+                    ((expected_end_l as f64) - physical_l).abs() < 1.0e-4,
+                    "sr={sr}: reference envelope {expected_end_l} != physical {physical_l}"
+                );
+
+                let mut baseline: Option<[f32; 4]> = None;
+
+                for &(label, pattern) in schedules {
+                    let clap_plug = ((*factory).create_plugin.unwrap())(factory, &host, (*desc).id);
+                    assert!(!clap_plug.is_null());
+                    assert!(((*clap_plug).init.unwrap())(clap_plug));
+                    assert!(((*clap_plug).activate.unwrap())(clap_plug, sr, 1, 2048));
+                    assert!(((*clap_plug).start_processing.unwrap())(clap_plug));
+                    let t = super::clap::test_telemetry(clap_plug);
+
+                    // All samples but the last follow the schedule; a final 1-frame block then
+                    // publishes exactly the envelope value at the last sample.
+                    let mut offset = 0_usize;
+                    let mut step_idx = 0_usize;
+                    while offset < total_samples - 1 {
+                        let block_len =
+                            pattern[step_idx % pattern.len()].min(total_samples - 1 - offset);
+                        process_clap_stereo_block(
+                            clap_plug,
+                            sr,
+                            offset as i64,
+                            &sig_l[offset..offset + block_len],
+                            &sig_r[offset..offset + block_len],
+                        );
+                        if offset == 0 {
+                            // Transient at the very start of a block must be shown at full level
+                            // (regression: end-of-block publication lost -4.4 dB at 2048 frames).
+                            let first = [
+                                load_f32_relaxed(&t.in_peak_l),
+                                load_f32_relaxed(&t.in_peak_r),
+                                load_f32_relaxed(&t.out_peak_l),
+                                load_f32_relaxed(&t.out_peak_r),
+                            ];
+                            assert_eq!(first[0].to_bits(), amp_l.to_bits(), "sr={sr} [{label}]");
+                            assert_eq!(first[1].to_bits(), amp_r.to_bits(), "sr={sr} [{label}]");
+                            assert!(
+                                (first[2] - amp_l).abs() < 1.0e-6 && (first[3] - amp_r).abs() < 1.0e-6,
+                                "sr={sr} [{label}]: first-block out peaks {first:?}"
+                            );
+                        }
+                        offset += block_len;
+                        step_idx += 1;
+                    }
+                    let last = total_samples - 1;
+                    process_clap_stereo_block(
+                        clap_plug,
+                        sr,
+                        last as i64,
+                        &sig_l[last..],
+                        &sig_r[last..],
+                    );
+
+                    let published = [
+                        load_f32_relaxed(&t.in_peak_l),
+                        load_f32_relaxed(&t.in_peak_r),
+                        load_f32_relaxed(&t.out_peak_l),
+                        load_f32_relaxed(&t.out_peak_r),
+                    ];
+                    assert_eq!(
+                        published[0].to_bits(),
+                        expected_end_l.to_bits(),
+                        "sr={sr} [{label}]: in L decay diverged from reference"
+                    );
+                    assert_eq!(
+                        published[1].to_bits(),
+                        expected_end_r.to_bits(),
+                        "sr={sr} [{label}]: in R decay diverged from reference"
+                    );
+                    assert!(
+                        (published[2] - expected_end_l).abs() < 1.0e-6
+                            && (published[3] - expected_end_r).abs() < 1.0e-6,
+                        "sr={sr} [{label}]: out decay diverged: {published:?}"
+                    );
+                    if let Some(base) = baseline {
+                        for idx in 0..4 {
+                            assert_eq!(
+                                published[idx].to_bits(),
+                                base[idx].to_bits(),
+                                "sr={sr} [{label}]: meter decay diverged across buffer sizes"
+                            );
+                        }
+                    } else {
+                        baseline = Some(published);
+                    }
+
+                    // Long silence tail must flush meter peaks to exact +0.0 without subnormals.
+                    // The bound is derived from the constants, not hard-coded.
+                    if sr == 48000.0 && label == "fixed_512" {
+                        let silence = vec![0.0_f32; 512];
+                        let flush_bound = (tau_samples
+                            * ((SAFETY_CLAMP_LIMIT / DENORMAL_FLUSH_THRESHOLD) as f64).ln()
+                            * 1.01)
+                            .ceil() as usize
+                            + 512;
+                        let mut processed = 0_usize;
+                        while processed < flush_bound {
+                            process_clap_stereo_block(
+                                clap_plug,
+                                sr,
+                                (total_samples + processed) as i64,
+                                &silence,
+                                &silence,
+                            );
+                            processed += 512;
+                            for v in [
+                                load_f32_relaxed(&t.in_peak_l),
+                                load_f32_relaxed(&t.in_peak_r),
+                                load_f32_relaxed(&t.out_peak_l),
+                                load_f32_relaxed(&t.out_peak_r),
+                            ] {
+                                assert!(v == 0.0 || v.is_normal(), "subnormal meter peak: {v}");
+                            }
+                        }
+                        for (name, val) in [
+                            ("in_peak_l", load_f32_relaxed(&t.in_peak_l)),
+                            ("in_peak_r", load_f32_relaxed(&t.in_peak_r)),
+                            ("out_peak_l", load_f32_relaxed(&t.out_peak_l)),
+                            ("out_peak_r", load_f32_relaxed(&t.out_peak_r)),
+                        ] {
+                            assert_eq!(
+                                val.to_bits(),
+                                0.0_f32.to_bits(),
+                                "{name} failed to flush to +0.0 after silence: {val}"
+                            );
+                        }
+
+                        // Transient in the middle of a large block is reported at full level
+                        let mut mid = vec![0.0_f32; 2048];
+                        mid[700] = 0.6;
+                        process_clap_stereo_block(clap_plug, sr, 0, &mid, &mid);
+                        assert_eq!(load_f32_relaxed(&t.in_peak_l).to_bits(), 0.6_f32.to_bits());
+                        assert_eq!(load_f32_relaxed(&t.in_peak_r).to_bits(), 0.6_f32.to_bits());
+
+                        // Verify CLAP stop_processing vs reset/deactivate telemetry clearing
+                        seed_telemetry(&t);
+                        ((*clap_plug).stop_processing.unwrap())(clap_plug);
+                        assert_eq!(load_f32_relaxed(&t.in_peak_l).to_bits(), 0.0_f32.to_bits());
+                        assert_eq!(load_f32_relaxed(&t.out_peak_r).to_bits(), 0.0_f32.to_bits());
+                        assert_eq!(load_f32_relaxed(&t.gain_match_db), 3.25);
+
+                        // Restarting audio invokes Plugin::reset() via nih-plug, so internal
+                        // ballistics restart from silence instead of resurrecting the pre-stop peak.
+                        assert!(((*clap_plug).start_processing.unwrap())(clap_plug));
+                        let quiet = vec![0.0_f32; 64];
+                        process_clap_stereo_block(clap_plug, sr, 0, &quiet, &quiet);
+                        assert_eq!(load_f32_relaxed(&t.in_peak_l).to_bits(), 0.0_f32.to_bits());
+                        assert_eq!(load_f32_relaxed(&t.out_peak_l).to_bits(), 0.0_f32.to_bits());
+
+                        seed_telemetry(&t);
+                        ((*clap_plug).reset.unwrap())(clap_plug);
+                        assert_eq!(load_f32_relaxed(&t.in_peak_l).to_bits(), 0.0_f32.to_bits());
+                        assert_eq!(load_f32_relaxed(&t.gain_match_db).to_bits(), 0.0_f32.to_bits());
+
+                        seed_telemetry(&t);
+                        ((*clap_plug).deactivate.unwrap())(clap_plug);
+                        assert_eq!(load_f32_relaxed(&t.out_peak_l).to_bits(), 0.0_f32.to_bits());
+                        assert_eq!(load_f32_relaxed(&t.gain_match_db).to_bits(), 0.0_f32.to_bits());
+                    } else {
+                        ((*clap_plug).stop_processing.unwrap())(clap_plug);
+                        ((*clap_plug).deactivate.unwrap())(clap_plug);
+                    }
+                    ((*clap_plug).destroy.unwrap())(clap_plug);
+                }
+            }
+
+            // 3. Verify VST3 set_processing(0) vs set_active(0) / terminate telemetry clearing
+            let raw_factory = super::vst3::GetPluginFactory();
+            let vst_factory =
+                VstPtr::<dyn IPluginFactory>::owned(raw_factory as *mut *mut _).unwrap();
+            let cid = IID {
+                data: OmorePunch::PLATFORM_VST3_CLASS_ID,
+            };
+            let mut raw_comp: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_eq!(
+                vst_factory.create_instance(&cid, &<dyn IComponent>::IID, &mut raw_comp),
+                kResultOk
+            );
+            let comp = VstPtr::<dyn IComponent>::owned(raw_comp as *mut *mut _).unwrap();
+            let proc_if = comp.cast::<dyn IAudioProcessor>().unwrap();
+            let vst_tel = super::vst3::take_test_vst3_telemetry().expect("VST3 telemetry missing");
+            assert_eq!(comp.initialize(std::ptr::null_mut()), kResultOk);
+
+            seed_telemetry(&vst_tel);
+            assert_eq!(proc_if.set_processing(0), kResultOk);
+            assert_eq!(load_f32_relaxed(&vst_tel.in_peak_l).to_bits(), 0.0_f32.to_bits());
+            assert_eq!(load_f32_relaxed(&vst_tel.out_peak_r).to_bits(), 0.0_f32.to_bits());
+            assert_eq!(load_f32_relaxed(&vst_tel.gain_match_db), 3.25);
+
+            seed_telemetry(&vst_tel);
+            assert_eq!(comp.set_active(0), kResultOk);
+            assert_eq!(load_f32_relaxed(&vst_tel.in_peak_l).to_bits(), 0.0_f32.to_bits());
+            assert_eq!(load_f32_relaxed(&vst_tel.gain_match_db).to_bits(), 0.0_f32.to_bits());
+
+            seed_telemetry(&vst_tel);
+            assert_eq!(comp.terminate(), kResultOk);
+            assert_eq!(load_f32_relaxed(&vst_tel.out_peak_l).to_bits(), 0.0_f32.to_bits());
+            assert_eq!(load_f32_relaxed(&vst_tel.gain_match_db).to_bits(), 0.0_f32.to_bits());
+        }
     }
 }
