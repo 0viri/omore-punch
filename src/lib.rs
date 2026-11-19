@@ -354,8 +354,19 @@ impl StereoPunchDsp {
     }
 
     #[inline(always)]
+    fn sanitize_sample_rate(&self, sample_rate: f32) -> f32 {
+        if sample_rate.is_finite() {
+            sample_rate.max(8000.0)
+        } else if self.sample_rate.is_finite() {
+            self.sample_rate.max(8000.0)
+        } else {
+            48000.0
+        }
+    }
+
+    #[inline(always)]
     fn update_gain_match_coeffs(&mut self, sample_rate: f32) {
-        let sr = sample_rate.max(8000.0);
+        let sr = self.sanitize_sample_rate(sample_rate);
         self.gm_rms_coeff = Self::exp_coeff_from_ms(GAIN_MATCH_RMS_MS, sr, 0.001);
         self.gm_presence_coeff = Self::exp_coeff_from_ms(GAIN_MATCH_PRESENCE_MS, sr, 0.001);
         self.gm_slew_coeff = Self::exp_coeff_from_ms(GAIN_MATCH_SLEW_MS, sr, 0.001);
@@ -364,9 +375,24 @@ impl StereoPunchDsp {
 
     #[inline(always)]
     fn update_bypass_coeff(&mut self, sample_rate: f32) {
-        let sr = sample_rate.max(8000.0);
+        let sr = self.sanitize_sample_rate(sample_rate);
         let ramp_samples = (BYPASS_RAMP_MS * 0.001 * sr).max(1.0);
         self.bypass_step = 1.0 / ramp_samples;
+    }
+
+    #[inline(always)]
+    fn apply_sample_rate_change(&mut self, sr: f32) {
+        self.sample_rate = sr;
+        self.cached_attack_ms = -1.0;
+        self.cached_release_ms = -1.0;
+        self.auto_coeffs_initialized = false;
+        self.cached_sc_hpf_hz = -1.0;
+        self.cached_eq_low_cut_hz = -1.0;
+        self.cached_eq_mid_cut_db = -999.0;
+        self.cached_eq_high_shelf_db = -999.0;
+        self.auto_slow_gr_db = 0.0;
+        self.update_gain_match_coeffs(sr);
+        self.update_bypass_coeff(sr);
     }
 
     #[inline(always)]
@@ -402,36 +428,47 @@ impl StereoPunchDsp {
 
     #[inline(always)]
     pub fn set_sample_rate(&mut self, sample_rate: f32) {
-        let sr = sample_rate.max(8000.0);
+        let sr = self.sanitize_sample_rate(sample_rate);
         if (sr - self.sample_rate).abs() > 1e-3 {
-            self.sample_rate = sr;
-            let att = self.cached_attack_ms.max(0.1);
-            let rel = self.cached_release_ms.max(10.0);
+            let att = if self.cached_attack_ms.is_finite() && self.cached_attack_ms > 0.0 {
+                self.cached_attack_ms.clamp(0.1, 100.0)
+            } else {
+                3.0
+            };
+            let rel = if self.cached_release_ms.is_finite() && self.cached_release_ms > 0.0 {
+                self.cached_release_ms.clamp(10.0, 500.0)
+            } else {
+                80.0
+            };
             let rel_mode = self.cached_release_mode;
-            let hpf = self.cached_sc_hpf_hz.clamp(20.0, 250.0);
-            let eq_lc = self.cached_eq_low_cut_hz.clamp(20.0, 160.0);
-            let eq_mc = if self.cached_eq_mid_cut_db < -100.0 {
+            let hpf = if self.cached_sc_hpf_hz.is_finite() && self.cached_sc_hpf_hz > 0.0 {
+                self.cached_sc_hpf_hz.clamp(20.0, 250.0)
+            } else {
+                20.0
+            };
+            let eq_lc = if self.cached_eq_low_cut_hz.is_finite() && self.cached_eq_low_cut_hz > 0.0 {
+                self.cached_eq_low_cut_hz.clamp(20.0, 160.0)
+            } else {
+                20.0
+            };
+            let eq_mc = if !self.cached_eq_mid_cut_db.is_finite()
+                || self.cached_eq_mid_cut_db < -100.0
+            {
                 0.0
             } else {
                 self.cached_eq_mid_cut_db.clamp(-12.0, 0.0)
             };
-            let eq_hs = if self.cached_eq_high_shelf_db < -100.0 {
+            let eq_hs = if !self.cached_eq_high_shelf_db.is_finite()
+                || self.cached_eq_high_shelf_db < -100.0
+            {
                 0.0
             } else {
                 self.cached_eq_high_shelf_db.clamp(-6.0, 12.0)
             };
-            self.cached_attack_ms = -1.0;
-            self.cached_release_ms = -1.0;
-            self.auto_coeffs_initialized = false;
-            self.cached_sc_hpf_hz = -1.0;
-            self.cached_eq_low_cut_hz = -1.0;
-            self.cached_eq_mid_cut_db = -999.0;
-            self.cached_eq_high_shelf_db = -999.0;
+            self.apply_sample_rate_change(sr);
             self.update_ballistics(sr, att, rel, rel_mode);
             self.update_sidechain_hpf(sr, hpf);
             self.update_eq(sr, eq_lc, eq_mc, eq_hs);
-            self.update_gain_match_coeffs(sr);
-            self.update_bypass_coeff(sr);
         }
     }
 
@@ -443,38 +480,39 @@ impl StereoPunchDsp {
         release_ms: f32,
         release_mode: ReleaseMode,
     ) {
-        let sr = sample_rate.max(8000.0);
-        let sr_changed = (sr - self.sample_rate).abs() > 1e-3;
-        let att_changed = (attack_ms - self.cached_attack_ms).abs() > 1e-5;
-        let rel_changed = (release_ms - self.cached_release_ms).abs() > 1e-5;
+        let sr = self.sanitize_sample_rate(sample_rate);
+        let att_ms = if attack_ms.is_finite() {
+            attack_ms.clamp(0.1, 100.0)
+        } else {
+            3.0
+        };
+        let rel_ms = if release_ms.is_finite() {
+            release_ms.clamp(10.0, 500.0)
+        } else {
+            80.0
+        };
+        if (sr - self.sample_rate).abs() > 1e-3 {
+            self.apply_sample_rate_change(sr);
+        }
+
+        let att_changed = (att_ms - self.cached_attack_ms).abs() > 1e-5;
+        let rel_changed = (rel_ms - self.cached_release_ms).abs() > 1e-5;
         let mode_changed =
             !self.auto_coeffs_initialized || release_mode != self.cached_release_mode;
 
-        if sr_changed {
-            self.cached_sc_hpf_hz = -1.0;
-            self.cached_eq_low_cut_hz = -1.0;
-            self.cached_eq_mid_cut_db = -999.0;
-            self.cached_eq_high_shelf_db = -999.0;
-            self.update_gain_match_coeffs(sr);
-            self.update_bypass_coeff(sr);
+        if att_changed {
+            self.cached_attack_ms = att_ms;
+            self.attack_coeff = Self::exp_coeff_from_ms(att_ms, sr, 0.0001);
         }
 
-        if sr_changed || att_changed {
-            self.sample_rate = sr;
-            self.cached_attack_ms = attack_ms;
-            self.attack_coeff = Self::exp_coeff_from_ms(attack_ms, sr, 0.0001);
+        if rel_changed {
+            self.cached_release_ms = rel_ms;
+            self.release_coeff = Self::exp_coeff_from_ms(rel_ms, sr, 0.001);
         }
 
-        if sr_changed || rel_changed {
-            self.sample_rate = sr;
-            self.cached_release_ms = release_ms;
-            self.release_coeff = Self::exp_coeff_from_ms(release_ms, sr, 0.001);
-        }
-
-        if sr_changed || mode_changed {
-            self.sample_rate = sr;
+        if mode_changed {
             self.cached_release_mode = release_mode;
-            if sr_changed || !self.auto_coeffs_initialized {
+            if !self.auto_coeffs_initialized {
                 self.auto_slow_charge_coeff =
                     Self::exp_coeff_from_ms(AUTO_SLOW_CHARGE_MS, sr, 0.001);
             }
@@ -487,22 +525,17 @@ impl StereoPunchDsp {
 
     #[inline(always)]
     pub fn update_sidechain_hpf(&mut self, sample_rate: f32, sc_hpf_hz: f32) {
-        let sr = sample_rate.max(8000.0);
-        let clamped_hz = sc_hpf_hz.clamp(20.0, 250.0);
-        let sr_changed = (sr - self.sample_rate).abs() > 1e-3;
-        let hpf_changed = (clamped_hz - self.cached_sc_hpf_hz).abs() > 1e-4;
-
-        if sr_changed {
-            self.cached_attack_ms = -1.0;
-            self.cached_release_ms = -1.0;
-            self.auto_coeffs_initialized = false;
-            self.cached_eq_low_cut_hz = -1.0;
-            self.cached_eq_mid_cut_db = -999.0;
-            self.cached_eq_high_shelf_db = -999.0;
+        let sr = self.sanitize_sample_rate(sample_rate);
+        let clamped_hz = if sc_hpf_hz.is_finite() {
+            sc_hpf_hz.clamp(20.0, 250.0)
+        } else {
+            20.0
+        };
+        if (sr - self.sample_rate).abs() > 1e-3 {
+            self.apply_sample_rate_change(sr);
         }
 
-        if sr_changed || hpf_changed {
-            self.sample_rate = sr;
+        if (clamped_hz - self.cached_sc_hpf_hz).abs() > 1e-4 {
             self.cached_sc_hpf_hz = clamped_hz;
             let rc = 1.0 / (2.0 * std::f32::consts::PI * clamped_hz);
             let dt = 1.0 / sr;
@@ -615,17 +648,9 @@ impl StereoPunchDsp {
         mid_cut_db: f32,
         high_shelf_db: f32,
     ) {
-        let sr = sample_rate.max(8000.0);
-        let sr_changed = (sr - self.sample_rate).abs() > 1e-3;
-        if sr_changed {
-            self.sample_rate = sr;
-            self.cached_attack_ms = -1.0;
-            self.cached_release_ms = -1.0;
-            self.auto_coeffs_initialized = false;
-            self.cached_sc_hpf_hz = -1.0;
-            self.cached_eq_low_cut_hz = -1.0;
-            self.cached_eq_mid_cut_db = -999.0;
-            self.cached_eq_high_shelf_db = -999.0;
+        let sr = self.sanitize_sample_rate(sample_rate);
+        if (sr - self.sample_rate).abs() > 1e-3 {
+            self.apply_sample_rate_change(sr);
         }
 
         let lc_hz = if low_cut_hz.is_finite() {
@@ -8516,5 +8541,152 @@ mod tests {
             assert_eq!(comp.terminate(), kResultOk);
             assert_eq!(comp_b.terminate(), kResultOk);
         }
+    }
+
+    #[test]
+    fn test_sample_rate_change_updates_all_coeffs_and_guards_non_finite() {
+        let cfg = DspConfig {
+            threshold_db: -24.0,
+            ratio: 8.0,
+            attack_ms: 4.5,
+            release_ms: 120.0,
+            release_mode: ReleaseMode::AutoPunch,
+            sc_hpf_hz: 90.0,
+            eq_low_cut_hz: 80.0,
+            eq_mid_cut_db: -3.5,
+            eq_high_shelf_db: 2.5,
+            gain_match: true,
+            ..DspConfig::default()
+        };
+
+        let mut reference = StereoPunchDsp::new(96000.0);
+        reference.process_sample(0.5, -0.5, &cfg);
+
+        // 1. Sample rate change triggered through every public entry point must match fresh 96 kHz
+        for entry in ["set_sample_rate", "update_ballistics", "update_sidechain_hpf", "update_eq"] {
+            let mut dsp = StereoPunchDsp::default();
+            // Warm up auto_slow_gr_db at 48 kHz first to verify reset on sample-rate change
+            for _ in 0..256 {
+                dsp.process_sample(0.8, 0.8, &cfg);
+            }
+            assert!(
+                dsp.auto_slow_gr_db > 0.1,
+                "[{entry}] expected non-zero auto_slow_gr_db before SR change"
+            );
+
+            match entry {
+                "set_sample_rate" => dsp.set_sample_rate(96000.0),
+                "update_ballistics" => {
+                    dsp.update_ballistics(96000.0, cfg.attack_ms, cfg.release_ms, cfg.release_mode);
+                }
+                "update_sidechain_hpf" => {
+                    dsp.update_sidechain_hpf(96000.0, cfg.sc_hpf_hz);
+                }
+                "update_eq" => {
+                    dsp.update_eq(
+                        96000.0,
+                        cfg.eq_low_cut_hz,
+                        cfg.eq_mid_cut_db,
+                        cfg.eq_high_shelf_db,
+                    );
+                }
+                _ => unreachable!(),
+            }
+
+            assert_eq!(
+                dsp.auto_slow_gr_db.to_bits(),
+                0.0_f32.to_bits(),
+                "[{entry}] auto_slow_gr_db must reset to 0.0 on sample rate change"
+            );
+            assert_eq!(
+                dsp.gm_rms_coeff.to_bits(),
+                reference.gm_rms_coeff.to_bits(),
+                "[{entry}] gm_rms_coeff stale after SR change"
+            );
+            assert_eq!(
+                dsp.gm_presence_coeff.to_bits(),
+                reference.gm_presence_coeff.to_bits(),
+                "[{entry}] gm_presence_coeff stale after SR change"
+            );
+            assert_eq!(
+                dsp.gm_slew_coeff.to_bits(),
+                reference.gm_slew_coeff.to_bits(),
+                "[{entry}] gm_slew_coeff stale after SR change"
+            );
+            assert_eq!(
+                dsp.gm_off_slew_coeff.to_bits(),
+                reference.gm_off_slew_coeff.to_bits(),
+                "[{entry}] gm_off_slew_coeff stale after SR change"
+            );
+            assert_eq!(
+                dsp.bypass_step.to_bits(),
+                reference.bypass_step.to_bits(),
+                "[{entry}] bypass_step stale after SR change"
+            );
+
+            // Subsequent set_sample_rate(96000.0) + process_sample must produce identical coefficients
+            dsp.set_sample_rate(96000.0);
+            dsp.process_sample(0.5, -0.5, &cfg);
+            assert_eq!(dsp.attack_coeff.to_bits(), reference.attack_coeff.to_bits());
+            assert_eq!(dsp.release_coeff.to_bits(), reference.release_coeff.to_bits());
+            assert_eq!(
+                dsp.auto_fast_release_coeff.to_bits(),
+                reference.auto_fast_release_coeff.to_bits()
+            );
+            assert_eq!(
+                dsp.auto_slow_release_coeff.to_bits(),
+                reference.auto_slow_release_coeff.to_bits()
+            );
+            assert_eq!(
+                dsp.auto_slow_charge_coeff.to_bits(),
+                reference.auto_slow_charge_coeff.to_bits()
+            );
+            assert_eq!(dsp.sc_hpf_coeff.to_bits(), reference.sc_hpf_coeff.to_bits());
+            assert_eq!(
+                dsp.eq_low_cut.coeffs.b0.to_bits(),
+                reference.eq_low_cut.coeffs.b0.to_bits()
+            );
+            assert_eq!(
+                dsp.eq_mid_cut.coeffs.b0.to_bits(),
+                reference.eq_mid_cut.coeffs.b0.to_bits()
+            );
+            assert_eq!(
+                dsp.eq_high_shelf.coeffs.b0.to_bits(),
+                reference.eq_high_shelf.coeffs.b0.to_bits()
+            );
+        }
+
+        // 2. Non-finite sample_rate / sc_hpf_hz / attack_ms / release_ms must never corrupt state
+        let mut guard_dsp = StereoPunchDsp::new(96000.0);
+        for bad_sr in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            guard_dsp.set_sample_rate(bad_sr);
+            guard_dsp.update_ballistics(bad_sr, f32::NAN, f32::INFINITY, ReleaseMode::AutoTight);
+            guard_dsp.update_sidechain_hpf(bad_sr, f32::NAN);
+            guard_dsp.update_eq(bad_sr, f32::NAN, f32::INFINITY, f32::NEG_INFINITY);
+        }
+        guard_dsp.update_sidechain_hpf(44100.0, f32::NAN);
+        guard_dsp.update_ballistics(44100.0, f32::NAN, f32::NEG_INFINITY, ReleaseMode::AutoGlue);
+
+        for (name, val) in [
+            ("sample_rate", guard_dsp.sample_rate),
+            ("attack_coeff", guard_dsp.attack_coeff),
+            ("release_coeff", guard_dsp.release_coeff),
+            ("auto_fast_release_coeff", guard_dsp.auto_fast_release_coeff),
+            ("auto_slow_release_coeff", guard_dsp.auto_slow_release_coeff),
+            ("auto_slow_charge_coeff", guard_dsp.auto_slow_charge_coeff),
+            ("sc_hpf_coeff", guard_dsp.sc_hpf_coeff),
+            ("gm_rms_coeff", guard_dsp.gm_rms_coeff),
+            ("gm_presence_coeff", guard_dsp.gm_presence_coeff),
+            ("gm_slew_coeff", guard_dsp.gm_slew_coeff),
+            ("gm_off_slew_coeff", guard_dsp.gm_off_slew_coeff),
+            ("bypass_step", guard_dsp.bypass_step),
+            ("eq_low_cut.b0", guard_dsp.eq_low_cut.coeffs.b0),
+            ("eq_mid_cut.b0", guard_dsp.eq_mid_cut.coeffs.b0),
+            ("eq_high_shelf.b0", guard_dsp.eq_high_shelf.coeffs.b0),
+        ] {
+            assert!(val.is_finite(), "Non-finite coefficient {name}: {val}");
+        }
+        let out = guard_dsp.process_sample(0.4, -0.4, &cfg);
+        assert!(out.out_l.is_finite() && out.out_r.is_finite());
     }
 }

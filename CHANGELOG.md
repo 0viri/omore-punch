@@ -32,6 +32,9 @@ Toutes les modifications notables de ce projet sont documentées dans ce fichier
   - Renommage des bundles générés en `Omore Punch.vst3` et `Omore Punch.clap` via `bundler.toml`, mise à jour des artefacts CI (`.github/workflows/build.yml`) et nettoyage automatique des anciens bundles `omore-punch.*` dans `build.sh` et `build.ps1`.
 
 ### Corrigé
+- **Cohérence des coefficients DSP sur changement de `sample_rate` et gardes non finis (`sr-change-gain-match-bypass-coeffs`) :**
+  - Centralisation de l'invalidation des caches et du recalcul des coefficients `Gain Match` (`gm_*_coeff`) et `Bypass` (`bypass_step`) avec remise à `0.0` de l'intégrateur `auto_slow_gr_db` dans `StereoPunchDsp::apply_sample_rate_change()`, appelée uniformément depuis `set_sample_rate()`, `update_ballistics()`, `update_sidechain_hpf()` et `update_eq()`.
+  - Ajout de gardes `.is_finite()` sur `sample_rate`, `sc_hpf_hz`, `attack_ms` et `release_ms` afin qu'aucune valeur `NaN` ou `Inf` ne puisse corrompre les coefficients internes.
 - **Flush anti-dénormaux dans `sanitize_sample()` et le filtre HPF de sidechain (`sanitize-sample-denormal-flush`) :**
   - Application uniforme du seuil anti-dénormaux (`1.0e-20`) dans `sanitize_sample()` et sur les mémoires d'entrée `sc_prev_in_l/r` du filtre passe-haut de sidechain via `flush_denormal()`, éliminant tout flottant subnormal en entrée, en sortie (y compris en bypass) et dans les états internes du détecteur tout en préservant la transparence bit-exacte des signaux normaux.
 
