@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== [Omore Punch] Execution des tests unitaires DSP ==="
-cargo test --release
+echo "=== [Omore Punch] Execution des tests unitaires (workspace) ==="
+cargo test --workspace --release
 
 echo "=== [Omore Punch] Bundling VST3 & CLAP (Release) ==="
 cargo run --package xtask --release -- bundle omore-punch --release

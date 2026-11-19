@@ -5,9 +5,9 @@ Write-Host "=================================================" -ForegroundColor 
 Write-Host "   Omore Punch - Build VST3 & CLAP (Windows)     " -ForegroundColor Cyan
 Write-Host "=================================================" -ForegroundColor Cyan
 
-# 1. Execution des tests unitaires DSP
-Write-Host "`n[1/3] Execution des tests unitaires DSP (Release)..." -ForegroundColor Cyan
-cargo test --release
+# 1. Execution des tests unitaires (workspace)
+Write-Host "`n[1/3] Execution des tests unitaires workspace (Release)..." -ForegroundColor Cyan
+cargo test --workspace --release
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Echec des tests unitaires DSP."
     exit $LASTEXITCODE
