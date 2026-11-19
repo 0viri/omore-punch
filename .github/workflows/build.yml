@@ -84,8 +84,8 @@ jobs:
           fi
           echo "ASCII check passed."
 
-      - name: Run DSP Unit Tests
-        run: cargo test --release
+      - name: Run Workspace Unit Tests
+        run: cargo test --workspace --release
 
       - name: Bundle VST3 and CLAP plugins
         run: cargo run --package xtask --release -- bundle omore-punch --release
